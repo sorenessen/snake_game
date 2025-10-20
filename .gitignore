@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+*.dSYM/
+
+# C/C++
+*.o
+*.obj
+*.out
+*.a
+*.so
+*.dll
+*.exe
+
+# Build outputs
+/build/
+/bin/
+/dist/
+/cmake-build-*/
+
+# Your compiled game binary
+snake

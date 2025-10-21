@@ -1,9 +1,9 @@
 // snake_raw.cpp — macOS-friendly console Snake with raw keyboard input
-// Poop → Bomb (harmless if eaten) system, with BIG 2×2 chomp head
+// Poop → Bomb (harmless if eaten) system, with BIG emoji head while chomping
 // - 0–15s: Good poop (brown ●). Eat it: slow to base & shrink up to 2.
 // - 15–30s: Arms into a flashing red bomb (✹). If you EAT it → neutralize (no penalty).
 // - 30s: If it EXPIRES (you didn't reach it), it despawns and queues +2 growth (mild punishment).
-// Big chomp: during eating frames, head becomes a 2×2 rounded circle with a directional mouth.
+// Big chomp: while eating, the head becomes a single wide round emoji (🟢) and then returns to normal.
 // Kept:
 // - Blue field, green snake (●), yellow food (●)
 // - Poop seeds under tail; 3 drops per food
@@ -38,12 +38,12 @@ static constexpr bool ENABLE_SOUNDS = true;
 static constexpr bool ENABLE_BEEP_FALLBACK = false;
 
 static const char* BITE_SOUNDS[] = { "Pop", "Bottle", "Funk", "Tink", "Ping" };
-static constexpr const char* FART_SOUND    = "Submarine"; // poop activates
-static constexpr const char* SPLASH_SOUND  = "Purr";      // splash ambience
-static constexpr const char* REWARD_SOUND  = "Glass";     // good poop eaten
-static constexpr const char* LEVEL_SOUND   = "Hero";      // level up
-static constexpr const char* BOMB_SOUND    = "Basso";     // bomb expire boom
-static constexpr const char* DISARM_SOUND  = "Ping";      // eating a bomb (harmless)
+static constexpr const char* FART_SOUND    = "Submarine";
+static constexpr const char* SPLASH_SOUND  = "Purr";
+static constexpr const char* REWARD_SOUND  = "Glass";
+static constexpr const char* LEVEL_SOUND   = "Hero";
+static constexpr const char* BOMB_SOUND    = "Basso";
+static constexpr const char* DISARM_SOUND  = "Ping";
 
 static inline void play_system_sound(const char* name) {
     if (!ENABLE_SOUNDS || name == nullptr) return;
@@ -77,9 +77,12 @@ static constexpr int TICK_DECR_MS = 10;  // level-up speed gain
 static constexpr int GROW_DECR_MS = 3;   // per-unit speed gain (food / idle / penalty growth)
 
 // Poop/Bomb timings & penalty
-static constexpr auto GOOD_WINDOW = std::chrono::seconds(15); // good poop duration
-static constexpr auto BOMB_WINDOW = std::chrono::seconds(15); // armed bomb duration (then expire)
-static constexpr int  BOMB_GROW_UNITS = 2;                    // punishment on bomb expiry (+2)
+static constexpr auto GOOD_WINDOW = std::chrono::seconds(15);
+static constexpr auto BOMB_WINDOW = std::chrono::seconds(15);
+static constexpr int  BOMB_GROW_UNITS = 2;
+
+// Wide-head glyph during chomp (double-width in most terminals)
+static const std::string WIDE_HEAD = "🟢";
 
 // ---------- Raw terminal guard ----------
 struct RawTerm {
@@ -307,14 +310,12 @@ static void cinematic_splash_and_wait() {
 struct Point { int r, c; };
 enum class Dir { Up, Down, Left, Right };
 
-// Poop lifecycle → Bomb (harmless if eaten)
 enum class PoopState { Good, Bomb };
-
 struct Poop {
     Point p;
     std::chrono::steady_clock::time_point activated_at;
     PoopState state{PoopState::Good};
-    bool expired_punished{false}; // to avoid double-penalty
+    bool expired_punished{false};
 };
 
 struct Explosion {
@@ -323,10 +324,6 @@ struct Explosion {
     std::vector<Point> ring;
 };
 
-// 2×2 big chomp overlay around head during eating
-// Uses quarter/triangle glyphs to feel round: ◜ ◝ ◟ ◞
-struct BigChompCell { Point p; const char* glyph; };
-
 struct Game {
     deque<Point> snake; // front=head
     Dir dir = Dir::Right;
@@ -334,35 +331,29 @@ struct Game {
     bool game_over = false;
     int score = 0;
 
-    // Bite animation (big 2×2 head)
+    // Bite animation (wide head while true)
     bool consuming = false;
     int chomp_frames = 0;
     static constexpr int CHOMP_TOTAL = 8;
 
     // Poop / Bombs
     int poop_to_drop = 0;
-    vector<Poop>  poops;       // active (good→bomb)
-    vector<Point> poop_seeds;  // seeds waiting until tail leaves
-    vector<Explosion> booms;   // explosion animations
+    vector<Poop>  poops;
+    vector<Point> poop_seeds;
+    vector<Explosion> booms;
 
-    // Growth queue (penalty growth, etc.)
-    int growth_pending = 0;    // if >0, keep tail for N ticks
-
-    // Level-up state
+    int growth_pending = 0;    // queued growth (penalties)
     int level = 1;
     int level_flash = 0;
     bool level_up_trigger = false;
 
-    // Reward: eat good poop → reset speed to base AND shrink
     int  reward_flash = 0;
     bool slow_down_trigger = false;
     int  shrink_amount = 0;
 
-    // Very slow idle bloat
     int  idle_ticks = 0;
     int  idle_bloat_threshold = 120;
 
-    // Per-growth speed bump trigger (+ amount this tick)
     bool speed_bump_trigger = false;
     int  speed_bump_amount  = 0;
 
@@ -377,7 +368,6 @@ struct Game {
     }
 
     void on_player_input() { idle_ticks = 0; }
-
     void refresh_idle_threshold() {
         idle_bloat_threshold = std::max(80, 120 - (level - 1) * 5);
     }
@@ -464,7 +454,7 @@ struct Game {
             }
         }
 
-        // Handle expiry with penalty
+        // Expire → penalty
         vector<Poop> remaining;
         remaining.reserve(poops.size());
         for (auto &pp : poops) {
@@ -520,45 +510,6 @@ struct Game {
         poop_seeds.swap(remaining);
     }
 
-    // Build the 2×2 big head overlay cells (positions + glyphs) for current frame.
-    // Head cell is the top-left of the 2×2 block for simplicity.
-    vector<BigChompCell> build_big_chomp_overlay() const {
-        vector<BigChompCell> out;
-        if (!consuming || snake.empty()) return out;
-
-        // open mouth on alternating frames
-        bool open = ((CHOMP_TOTAL - chomp_frames) % 2) == 1;
-
-        // 2×2 positions: TL, TR, BL, BR relative to head (top-left at head)
-        Point h = snake.front();
-        Point TL = h;
-        Point TR = { h.r, (h.c + 1) % COLS };
-        Point BL = { (h.r + 1) % ROWS, h.c };
-        Point BR = { (h.r + 1) % ROWS, (h.c + 1) % COLS };
-
-        // Default closed-circle glyphs (rounded feel)
-        const char* gTL = "◜";
-        const char* gTR = "◝";
-        const char* gBL = "◟";
-        const char* gBR = "◞";
-
-        if (open) {
-            // Remove the two quadrants on the mouth side to create a wedge.
-            switch (dir) {
-                case Dir::Right: gTR = " "; gBR = " "; break;
-                case Dir::Left:  gTL = " "; gBL = " "; break;
-                case Dir::Up:    gTL = " "; gTR = " "; break;
-                case Dir::Down:  gBL = " "; gBR = " "; break;
-            }
-        }
-
-        out.push_back({TL, gTL});
-        out.push_back({TR, gTR});
-        out.push_back({BL, gBL});
-        out.push_back({BR, gBR});
-        return out;
-    }
-
     void update() {
         if (game_over) return;
 
@@ -603,7 +554,7 @@ struct Game {
 
         Point nh = next_head(snake.front());
 
-        // food → start big-chomp animation
+        // start chomp
         if (nh.r == food.r && nh.c == food.c) {
             consuming = true;
             chomp_frames = CHOMP_TOTAL;
@@ -628,11 +579,9 @@ struct Game {
 
         if (on_poop) {
             PoopState st = poops[poop_idx].state;
-            // consume the item
             poops.erase(poops.begin() + (long)poop_idx);
 
             if (st == PoopState::Good) {
-                // grow this tick (keep tail), then slow + shrink up to 2
                 grew_this_tick = true;
                 slow_down_trigger = true;
 
@@ -641,14 +590,12 @@ struct Game {
                 int can_remove = std::max(0, (int)snake.size() - safe_min);
                 int to_remove = std::min(desired, can_remove);
                 shrink_amount = to_remove;
-                while (to_remove-- > 0 && !snake.empty()) {
-                    snake.pop_back();
-                }
+                while (to_remove-- > 0 && !snake.empty()) snake.pop_back();
 
                 reward_flash = 10;
                 play_system_sound(REWARD_SOUND);
             } else {
-                // Bomb eaten → harmless (disarm)
+                // Bomb eaten → harmless
                 play_system_sound(DISARM_SOUND);
             }
         } else if (growth_pending > 0) {
@@ -667,7 +614,7 @@ struct Game {
             snake.pop_back();
         }
 
-        // Queue poop seed where the tail was; activates only when vacated
+        // queue poop seed
         if (poop_to_drop > 0) {
             poop_seeds.push_back(tail_before);
             poop_to_drop--;
@@ -710,20 +657,10 @@ struct Game {
         for (int c = 0; c < COLS; ++c) cout << '-';
         cout << "+\n";
 
-        // Build big-chomp overlay (once per frame)
-        vector<BigChompCell> big = build_big_chomp_overlay();
-
-        auto draw_big_if_any = [&](int rr, int cc) -> bool {
-            for (const auto& cell : big) {
-                if (cell.p.r == rr && cell.p.c == cc) {
-                    cout << FG_BRIGHT_GREEN << cell.glyph << FG_WHITE;
-                    return true;
-                }
-            }
-            return false;
-        };
-
         // rows
+        Point head = snake.front();
+        bool show_wide_head = consuming && head.c < COLS - 1; // avoid overflow at far right
+
         for (int r = 0; r < ROWS; ++r) {
             for (int i = 0; i < pad; ++i) cout << ' ';
             cout << '|';
@@ -732,7 +669,7 @@ struct Game {
             cout << BG_BLUE << FG_WHITE;
 
             for (int c = 0; c < COLS; ++c) {
-                // explosion overlay
+                // explosions
                 bool drew_boom = false;
                 for (const auto &b : booms) {
                     if ((r == b.center.r && c == b.center.c)) {
@@ -750,22 +687,27 @@ struct Game {
                 }
                 if (drew_boom) continue;
 
-                // BIG HEAD overlay takes precedence (and hides food beneath)
-                if (draw_big_if_any(r, c)) continue;
+                // Big head (double-width emoji). Skip the next column we occupy.
+                if (show_wide_head && r == head.r && c == head.c) {
+                    std::cout << WIDE_HEAD;
+                    ++c; // skip the next cell because emoji is double-width
+                    continue;
+                }
 
-                // food (normal draw when not covered by big head)
+                // Food
                 if (food.r == r && food.c == c) {
                     cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
                     continue;
                 }
 
-                // snake HEAD (when not chomping)
-                if (!consuming && !snake.empty() && snake.front().r == r && snake.front().c == c) {
+                // Head (normal when not wide)
+                if ((!show_wide_head || r != head.r || c != head.c) &&
+                    r == head.r && c == head.c) {
                     cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
                     continue;
                 }
 
-                // BODY
+                // Body
                 bool on_body = false;
                 for (size_t i = 1; i < snake.size(); ++i) {
                     if (snake[i].r == r && snake[i].c == c) { on_body = true; break; }
@@ -813,6 +755,7 @@ int main() {
 
     RawTerm raw;
 
+    // Splash
     cinematic_splash_and_wait();
 
     Game game;

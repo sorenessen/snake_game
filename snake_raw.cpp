@@ -1,18 +1,12 @@
 // snake_raw.cpp — macOS-friendly console Snake with raw keyboard input
-// Features kept:
-// - Blue playfield, green snake ("●"), yellow food ("●")
-// - Pac-Man-ish gulp overlay when eating
-// - Poop trail: 3 brown dots after each eat, fading
-// - Sounds: randomized bite (Pop/Bottle/Funk/Tink/Ping), "Submarine" on poop
-// - Splash: inline PNG if kitty/iTerm2 supports it; otherwise colored ASCII splash
-// - Centered board rendering
-// - Level Up every +100 pts (faster)
-// - Reward: eating your own poop resets speed to base AND shrinks snake by 2
-//
-// New in this file:
-// - On each Level Up, snake gains +1 extra segment (growth bonus)
-// - If the player never turns, the snake "auto-bloats": every N straight steps it grows +1
-// - Game Over offers "R to restart" or "Q to quit"
+// Poop → Bomb (gentle) system
+// - 0–15s: Good poop (brown ●). Eat it to slow to base & shrink up to 2.
+// - 15–30s: Arms into a flashing red bomb (✹). Hitting it adds **+2 length** (mild punishment) with a short starburst.
+// - 30s+: despawns if untouched.
+// Kept:
+// - Blue field, green snake (●), yellow food (●); Pac-Man gulp overlay
+// - Poop seeds under tail; 3 drops per food
+// - Idle bloat, level-ups every +100, per-growth speed bump, centered board, splash
 
 #include <algorithm>
 #include <atomic>
@@ -42,9 +36,11 @@ static constexpr bool ENABLE_SOUNDS = true;
 static constexpr bool ENABLE_BEEP_FALLBACK = false;
 
 static const char* BITE_SOUNDS[] = { "Pop", "Bottle", "Funk", "Tink", "Ping" };
-static constexpr const char* FART_SOUND    = "Submarine";
-static constexpr const char* SPLASH_SOUND  = "Purr";   // soft hiss/rumble
-static constexpr const char* REWARD_SOUND  = "Glass";  // when eating poop
+static constexpr const char* FART_SOUND    = "Submarine"; // poop activates
+static constexpr const char* SPLASH_SOUND  = "Purr";      // splash ambience
+static constexpr const char* REWARD_SOUND  = "Glass";     // good poop eaten
+static constexpr const char* LEVEL_SOUND   = "Hero";      // level up
+static constexpr const char* BOMB_SOUND    = "Basso";     // boom (macOS)
 
 static inline void play_system_sound(const char* name) {
     if (!ENABLE_SOUNDS || name == nullptr) return;
@@ -64,20 +60,23 @@ static constexpr const char* FG_WHITE = "\x1b[37m";
 static constexpr const char* FG_BRIGHT_YELLOW = "\x1b[93m";
 static constexpr const char* FG_BRIGHT_GREEN  = "\x1b[92m";
 static constexpr const char* FG_BROWN_256     = "\x1b[38;5;130m";
-static constexpr const char* FG_GRAY          = "\x1b[90m";
-static constexpr const char* FG_GREEN         = "\x1b[32m";
+static constexpr const char* FG_RED           = "\x1b[91m";
+static constexpr const char* FG_ORANGE_208    = "\x1b[38;5;208m";
+static constexpr const char* FG_YELLOW        = "\x1b[33m";
 
 // ---------- Config ----------
 static constexpr int ROWS = 20;
 static constexpr int COLS = 80;
 // Dynamic speed control:
-static constexpr int BASE_TICK_MS = 100; // original speed (10 FPS)
+static constexpr int BASE_TICK_MS = 100; // 10 FPS
 static constexpr int MIN_TICK_MS  = 40;  // fastest cap
-static constexpr int TICK_DECR_MS = 10;  // each level-up speeds by -10ms
-static constexpr int POOP_TTL     = 12;  // poop fades
+static constexpr int TICK_DECR_MS = 10;  // level-up speed gain
+static constexpr int GROW_DECR_MS = 3;   // per-unit speed gain (food / idle / bomb penalty)
 
-// New: if the player never turns, every BLOAT_PERIOD_STEPS straight steps → +1 length
-static constexpr int BLOAT_PERIOD_STEPS = 240; // tune to taste
+// Poop/Bomb timings & penalty
+static constexpr auto GOOD_WINDOW = std::chrono::seconds(15); // good poop duration
+static constexpr auto BOMB_WINDOW = std::chrono::seconds(15); // armed bomb duration (then despawn)
+static constexpr int  BOMB_GROW_UNITS = 2;                    // softened punishment (+2)
 
 // ---------- Raw terminal guard ----------
 struct RawTerm {
@@ -111,7 +110,7 @@ optional<char> read_key_now() {
 }
 void enqueue(char ch) {
     ch = static_cast<char>(toupper(static_cast<unsigned char>(ch)));
-    if (ch == 'W' || ch == 'A' || ch == 'S' || ch == 'D' || ch == 'Q' || ch == 'R') {
+    if (ch == 'W' || ch == 'A' || ch == 'S' || ch == 'D' || ch == 'Q') {
         lock_guard<mutex> lk(in_mtx);
         in_q.push(ch);
     }
@@ -126,8 +125,7 @@ optional<char> poll_key() {
 // ---------- Helpers ----------
 static bool have_cmd(const char* name) {
     std::string cmd = "command -v ";
-    cmd += name;
-    cmd += " >/dev/null 2>&1";
+    cmd += name; cmd += " >/dev/null 2>&1";
     return std::system(cmd.c_str()) == 0;
 }
 static bool file_exists(const char* p) {
@@ -139,12 +137,12 @@ static bool env_set(const char* name) { return std::getenv(name) != nullptr; }
 static int term_cols() {
     winsize ws{};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
-    return COLS; // fallback
+    return COLS;
 }
 static int term_rows() {
     winsize ws{};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
-    return ROWS + 6; // slack for title/prompt
+    return ROWS + 6;
 }
 
 // centered print using current terminal width
@@ -242,18 +240,16 @@ static void cinematic_splash_and_wait() {
     int img_cols = std::max(10, (cols * SPLASH_SCALE_PCT) / 100);
     int pad = std::max(0, (cols - img_cols) / 2);
 
-    // --- iTerm2: inline PNG (OSC 1337), centered via left padding + width in cells ---
+    // --- iTerm2: inline PNG (OSC 1337) ---
     if (!showed_image && is_iterm() && file_exists(SPLASH_PATH)) {
         std::string data;
         if (read_file(SPLASH_PATH, data)) {
             center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
             std::cout << "\n";
-
             for (int i = 0; i < pad; ++i) std::cout << ' ';
             std::string b64 = b64_encode(data);
             std::cout << "\x1b]1337;File=name=splash.png;inline=1;width="
-                      << img_cols << ";preserveAspectRatio=1:"
-                      << b64 << "\x07\n";
+                      << img_cols << ";preserveAspectRatio=1:" << b64 << "\x07\n";
             showed_image = true;
         }
     }
@@ -271,7 +267,7 @@ static void cinematic_splash_and_wait() {
         std::cout << "\n";
     }
 
-    // --- iTerm2 imgcat CLI fallback ---
+    // --- iTerm2 imgcat CLI ---
     if (!showed_image && is_iterm() && have_cmd("imgcat") && file_exists(SPLASH_PATH)) {
         showed_image = true;
         std::cout << "\x1b[2J\x1b[H";
@@ -283,11 +279,7 @@ static void cinematic_splash_and_wait() {
         std::cout << "\n";
     }
 
-    // --- Fallback: centered ASCII splash ---
-    if (!showed_image) {
-        std::cout << "\x1b[2J\x1b[H";
-        ascii_splash_art();
-    }
+    if (!showed_image) { std::cout << "\x1b[2J\x1b[H"; ascii_splash_art(); }
 
     // Pulsing centered prompt
     bool bright = true;
@@ -316,7 +308,22 @@ static void cinematic_splash_and_wait() {
 // ---------- Game model ----------
 struct Point { int r, c; };
 enum class Dir { Up, Down, Left, Right };
-struct Poop { Point p; int ttl; };
+
+// Poop lifecycle → Bomb
+enum class PoopState { Good, Bomb };
+
+struct Poop {
+    Point p;
+    std::chrono::steady_clock::time_point activated_at;
+    PoopState state{PoopState::Good};
+};
+
+struct Explosion {
+    // gentle starburst for a few frames
+    Point center;
+    int frames_left{5}; // shorter (~0.5s at base speed)
+    std::vector<Point> ring;
+};
 
 struct Game {
     deque<Point> snake; // front=head
@@ -330,24 +337,32 @@ struct Game {
     int chomp_frames = 0;
     static constexpr int CHOMP_TOTAL = 8;
 
-    // Poop
+    // Poop / Bombs
     int poop_to_drop = 0;
-    vector<Poop> poops;
+    vector<Poop>  poops;       // active (good or bomb)
+    vector<Point> poop_seeds;  // seeds waiting until tail leaves
+    vector<Explosion> booms;   // explosion animations
 
-    // Level-up/state
+    // Growth queue (for bomb punishment etc.)
+    int growth_pending = 0;    // if >0, skip tail pops for N ticks
+
+    // Level-up state
     int level = 1;
     int level_flash = 0;
     bool level_up_trigger = false;
 
-    // Reward: eat your own poop → reset speed to base AND shrink
-    int reward_flash = 0;
+    // Reward: eat good poop → reset speed to base AND shrink
+    int  reward_flash = 0;
     bool slow_down_trigger = false;
     int  shrink_amount = 0;
 
-    // New: track turns/straight movement + growth budget
-    bool turned_since_last_step = false;
-    int  straight_steps = 0;
-    int  grow_pending = 0;
+    // Very slow idle bloat
+    int  idle_ticks = 0;
+    int  idle_bloat_threshold = 120;
+
+    // Per-growth speed bump trigger (+ amount this tick)
+    bool speed_bump_trigger = false;
+    int  speed_bump_amount  = 0;
 
     mt19937 rng{random_device{}()};
 
@@ -357,6 +372,12 @@ struct Game {
         snake.push_back({r, c - 1});
         snake.push_back({r, c - 2});
         place_food();
+    }
+
+    void on_player_input() { idle_ticks = 0; }
+
+    void refresh_idle_threshold() {
+        idle_bloat_threshold = std::max(80, 120 - (level - 1) * 5);
     }
 
     Point wrap(Point p) const {
@@ -386,8 +407,7 @@ struct Game {
         }
     }
 
-    // Returns true if direction actually changed (used for "straight" tracking)
-    bool change_dir(char key) {
+    void change_dir(char key) {
         auto opp = [&](Dir a, Dir b) {
             return (a == Dir::Up && b == Dir::Down) ||
                    (a == Dir::Down && b == Dir::Up) ||
@@ -399,23 +419,34 @@ struct Game {
         else if (key == 'S') ndir = Dir::Down;
         else if (key == 'A') ndir = Dir::Left;
         else if (key == 'D') ndir = Dir::Right;
+        if (!opp(dir, ndir)) dir = ndir;
+    }
 
-        if (ndir != dir && !opp(dir, ndir)) {
-            dir = ndir;
-            turned_since_last_step = true;
-            return true;
-        }
+    void tick_poop_lifecycle() {
+        using clock = std::chrono::steady_clock;
+        const auto now = clock::now();
+        poops.erase(remove_if(poops.begin(), poops.end(),
+            [&](Poop &pp){
+                auto age = now - pp.activated_at;
+                if (age >= GOOD_WINDOW + BOMB_WINDOW) return true; // despawn after 30s total
+                if (age >= GOOD_WINDOW) pp.state = PoopState::Bomb; // arm into bomb after 15s
+                return false;
+            }), poops.end());
+    }
+
+    void decay_booms() {
+        for (auto &b : booms) b.frames_left--;
+        booms.erase(remove_if(booms.begin(), booms.end(),
+                              [](const Explosion& e){ return e.frames_left <= 0; }),
+                    booms.end());
+    }
+
+    bool cell_on_snake(int rr, int cc) const {
+        for (const auto& seg : snake) if (seg.r == rr && seg.c == cc) return true;
         return false;
     }
 
-    void decay_poops() {
-        for (auto &pp : poops) pp.ttl--;
-        poops.erase(remove_if(poops.begin(), poops.end(),
-                              [](const Poop& p){ return p.ttl <= 0; }),
-                    poops.end());
-    }
-
-    bool has_poop_at(Point p, size_t* idx_out=nullptr) const {
+    bool find_poop_at(Point p, size_t* idx_out=nullptr) const {
         for (size_t i = 0; i < poops.size(); ++i) {
             if (poops[i].p.r == p.r && poops[i].p.c == p.c) {
                 if (idx_out) *idx_out = i;
@@ -425,12 +456,70 @@ struct Game {
         return false;
     }
 
+    void maybe_activate_poops() {
+        if (poop_seeds.empty()) return;
+        vector<Point> remaining;
+        remaining.reserve(poop_seeds.size());
+        auto now = std::chrono::steady_clock::now();
+        for (const auto& s : poop_seeds) {
+            if (!cell_on_snake(s.r, s.c)) {
+                Poop pp; pp.p = s; pp.activated_at = now; pp.state = PoopState::Good;
+                poops.push_back(pp);
+                play_system_sound(FART_SOUND);
+            } else {
+                remaining.push_back(s);
+            }
+        }
+        poop_seeds.swap(remaining);
+    }
+
+    static vector<Point> explosion_ring(Point c) {
+        // just an 8-neighborhood for subtle boom
+        vector<Point> v = {
+            {c.r-1,c.c-1},{c.r-1,c.c},{c.r-1,c.c+1},
+            {c.r  ,c.c-1},           {c.r  ,c.c+1},
+            {c.r+1,c.c-1},{c.r+1,c.c},{c.r+1,c.c+1}
+        };
+        for (auto &p : v) {
+            if (p.r < 0) p.r += ROWS;
+            if (p.r >= ROWS) p.r -= ROWS;
+            if (p.c < 0) p.c += COLS;
+            if (p.c >= COLS) p.c -= COLS;
+        }
+        return v;
+    }
+
+    void trigger_bomb(Point at) {
+        // queue +2 growth (gentle)
+        growth_pending += BOMB_GROW_UNITS;
+
+        // apply per-growth speed bump for the same count this tick
+        speed_bump_trigger = true;
+        speed_bump_amount  += BOMB_GROW_UNITS;
+
+        // spawn small explosion animation
+        Explosion e;
+        e.center = at;
+        e.frames_left = 5; // brief
+        e.ring = explosion_ring(at);
+        booms.push_back(e);
+
+        play_system_sound(BOMB_SOUND);
+    }
+
     void update() {
         if (game_over) return;
 
-        decay_poops();
+        // lifecycle / animation ticks
+        tick_poop_lifecycle();
+        maybe_activate_poops();
+        decay_booms();
+
         if (level_flash  > 0) level_flash--;
         if (reward_flash > 0) reward_flash--;
+
+        // idle bloat timer
+        idle_ticks++;
 
         if (consuming) {
             if (--chomp_frames <= 0) {
@@ -442,14 +531,17 @@ struct Game {
                 snake.push_front(nh); // grow on food
                 score += 10;
 
-                // Level-up every 100 pts: speed up + flash + growth bonus
+                // per-growth bump
+                speed_bump_trigger = true;
+                speed_bump_amount  += 1;
+
+                // level-up every 100
                 if (score % 100 == 0) {
                     level++;
                     level_flash = 12;
                     level_up_trigger = true;
-                    play_system_sound("Hero");
-                    // NEW: growth bonus on level-up
-                    grow_pending += 1;
+                    play_system_sound(LEVEL_SOUND);
+                    refresh_idle_threshold();
                 }
 
                 play_random_bite_sound(rng);
@@ -458,82 +550,88 @@ struct Game {
                 place_food();
                 consuming = false;
             }
-            // Reset straight tracking after a chomped move resolves
-            turned_since_last_step = false;
             return;
         }
 
         Point nh = next_head(snake.front());
 
-        // Begin chomp if we’re about to eat
+        // If the next cell is food → begin chomp animation
         if (nh.r == food.r && nh.c == food.c) {
             consuming = true;
             chomp_frames = CHOMP_TOTAL;
             return;
         }
 
-        // Poop reward?
+        // Poop / Bomb check
         size_t poop_idx = 0;
-        bool eat_poop = has_poop_at(nh, &poop_idx);
+        bool on_poop = find_poop_at(nh, &poop_idx);
 
-        // Self collision
+        // Self-collision
         if (any_of(snake.begin(), snake.end(),
                    [&](const Point& p){ return p.r == nh.r && p.c == nh.c; })) {
             game_over = true; return;
         }
 
-        // Move head forward
+        // Move head
         Point tail_before = snake.back();
         snake.push_front(nh);
 
-        // Apply growth budget (level bonus or auto-bloat), else move tail
-        if (eat_poop) {
-            // Consuming poop: still move (no pop), but reward applies below
-            // So treat as growth this step (no pop).
-        } else if (grow_pending > 0) {
-            grow_pending--; // keep the extra segment (no pop)
-        } else {
-            // normal movement: drop tail
+        bool grew_this_tick = false;
+
+        if (on_poop) {
+            PoopState st = poops[poop_idx].state;
+            Point where = poops[poop_idx].p;
+            // consume the item
+            poops.erase(poops.begin() + (long)poop_idx);
+
+            if (st == PoopState::Good) {
+                // keep tail (grow this tick), then slow + shrink
+                grew_this_tick = true;
+                slow_down_trigger = true;
+
+                int safe_min = 3;
+                int desired = 2;
+                int can_remove = std::max(0, (int)snake.size() - safe_min);
+                int to_remove = std::min(desired, can_remove);
+                shrink_amount = to_remove;
+                while (to_remove-- > 0 && !snake.empty()) {
+                    snake.pop_back();
+                }
+
+                reward_flash = 10;
+                play_system_sound(REWARD_SOUND);
+            } else {
+                // Bomb: mild punishment — +2 total growth
+                grew_this_tick = true; // keep tail now (+1)
+                growth_pending += (BOMB_GROW_UNITS - 1); // remaining queued
+                speed_bump_trigger = true;
+                speed_bump_amount  += BOMB_GROW_UNITS;
+                trigger_bomb(where);
+            }
+        } else if (growth_pending > 0) {
+            // consume queued growth gradually
+            grew_this_tick = true;
+            growth_pending--;
+            speed_bump_trigger = true;
+            speed_bump_amount  += 1;
+        } else if (idle_ticks >= idle_bloat_threshold) {
+            // idle bloat: +1
+            grew_this_tick = true;
+            idle_ticks = 0;
+            speed_bump_trigger = true;
+            speed_bump_amount  += 1;
+        }
+
+        if (!grew_this_tick) {
+            // normal move: pop tail
             snake.pop_back();
         }
 
-        // Handle poop eating reward
-        if (eat_poop) {
-            poops.erase(poops.begin() + (long)poop_idx);
-            slow_down_trigger = true;   // main() returns to base speed
-
-            // Shrink by up to 2 (not below length 3)
-            int safe_min = 3;
-            int desired = 2;
-            int can_remove = std::max(0, (int)snake.size() - safe_min);
-            int to_remove = std::min(desired, can_remove);
-            shrink_amount = to_remove;
-            while (to_remove-- > 0 && !snake.empty()) snake.pop_back();
-
-            reward_flash = 10;
-            play_system_sound(REWARD_SOUND);
-        }
-
-        // Drop poop from previous tail if queued
+        // Queue poop seed where the tail was; activates only when vacated
         if (poop_to_drop > 0) {
-            poops.push_back(Poop{tail_before, POOP_TTL});
+            poop_seeds.push_back(tail_before);
             poop_to_drop--;
-            play_system_sound(FART_SOUND);
         }
-
-        // ---- Auto-bloat logic ----
-        if (turned_since_last_step) {
-            straight_steps = 0;               // a turn resets the counter
-        } else {
-            straight_steps++;
-            int dynamic_period = BLOAT_PERIOD_STEPS + (level - 1) * 60; // slower bloat per level
-if (straight_steps >= dynamic_period) {
-    grow_pending++;
-    straight_steps = 0;
-}
-
-        }
-        turned_since_last_step = false;        // clear for next tick
     }
 
     // Pac-Man style circular overlay (5x5) for gulp
@@ -578,9 +676,12 @@ if (straight_steps >= dynamic_period) {
         return true;
     }
 
-    bool cell_has_poop(int rr, int cc) const {
+    bool cell_has_good_or_bomb(int rr, int cc, PoopState* st_out=nullptr) const {
         for (const auto& p : poops) {
-            if (p.p.r == rr && p.p.c == cc) return true;
+            if (p.p.r == rr && p.p.c == cc) {
+                if (st_out) *st_out = p.state;
+                return true;
+            }
         }
         return false;
     }
@@ -595,8 +696,9 @@ if (straight_steps >= dynamic_period) {
         // centered score/status line
         {
             std::string status = "Score: " + std::to_string(score) + "   Level: " + std::to_string(level);
-            if (consuming)    status += "   (CHOMP!)";
-            if (poop_to_drop) status += "   (Dropping...)";
+            if (consuming)           status += "   (CHOMP!)";
+            if (!poop_seeds.empty()) status += "   (Dropping...)";
+            if (growth_pending > 0)  status += "   (Bomb growth +" + std::to_string(growth_pending) + ")";
             if (reward_flash > 0) {
                 status += "   \x1b[93m(Time slowed!";
                 if (shrink_amount > 0) status += "  Length -" + std::to_string(shrink_amount);
@@ -616,10 +718,29 @@ if (straight_steps >= dynamic_period) {
             for (int i = 0; i < pad; ++i) cout << ' ';
             cout << '|';
             bool invert = (level_flash > 0 && ((level_flash / 2) % 2 == 0));
-            if (invert) cout << "\x1b[7m"; // reverse video
+            if (invert) cout << "\x1b[7m";
             cout << BG_BLUE << FG_WHITE;
 
             for (int c = 0; c < COLS; ++c) {
+                // explosion overlay first
+                bool drew_boom = false;
+                for (const auto &b : booms) {
+                    if ((r == b.center.r && c == b.center.c)) {
+                        cout << FG_ORANGE_208 << "✹" << FG_WHITE;
+                        drew_boom = true; break;
+                    }
+                    for (const auto &p : b.ring) {
+                        if (p.r == r && p.c == c) {
+                            // flicker + / ×
+                            cout << ((b.frames_left % 2) ? FG_RED : FG_YELLOW)
+                                 << ((b.frames_left % 2) ? "+" : "×") << FG_WHITE;
+                            drew_boom = true; break;
+                        }
+                    }
+                    if (drew_boom) break;
+                }
+                if (drew_boom) continue;
+
                 const char* overlayGlyph = nullptr;
                 if (pac_overlay(r, c, overlayGlyph)) {
                     cout << FG_BRIGHT_GREEN << overlayGlyph << FG_WHITE;
@@ -629,14 +750,27 @@ if (straight_steps >= dynamic_period) {
                     cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
                     continue;
                 }
+
+                // snake
                 bool on_snake = false;
                 for (const auto& seg : snake) {
                     if (seg.r == r && seg.c == c) { on_snake = true; break; }
                 }
                 if (on_snake) {
                     cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
-                } else if (cell_has_poop(r, c)) {
-                    cout << FG_BROWN_256 << "●" << FG_WHITE;
+                    continue;
+                }
+
+                // poop / bomb
+                PoopState st;
+                if (cell_has_good_or_bomb(r, c, &st)) {
+                    if (st == PoopState::Good) {
+                        cout << FG_BROWN_256 << "●" << FG_WHITE;
+                    } else {
+                        bool flash = ((std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch()).count()/240) % 2) == 0;
+                        cout << (flash ? FG_RED : FG_ORANGE_208) << "✹" << FG_WHITE;
+                    }
                 } else {
                     cout << ' ';
                 }
@@ -652,8 +786,8 @@ if (straight_steps >= dynamic_period) {
         cout << "+\n";
 
         // controls/help
-        center_line("W/A/S/D to move | R to restart | Q to quit");
-        if (game_over) center_line("Game Over. Press R to restart or Q to quit.");
+        center_line("W/A/S/D to move, Q to quit.");
+        if (game_over) center_line("Game Over. Press Q to exit.");
 
         if (level_flash > 0) {
             center_line("\x1b[1m\x1b[93mLEVEL UP!  Speed increased\x1b[0m");
@@ -669,14 +803,11 @@ int main() {
 
     RawTerm raw;
 
-    // Splash (inline PNG or ASCII), inside terminal
+    // Splash
     cinematic_splash_and_wait();
 
-    auto new_game = []() {
-        return Game{};
-    };
-
-    Game game = new_game();
+    Game game;
+    game.refresh_idle_threshold();
 
     // dynamic tick
     int tick_ms = BASE_TICK_MS;
@@ -685,6 +816,7 @@ int main() {
 
     while (running.load()) {
         // pump raw keys
+        bool steered_this_frame = false;
         while (true) {
             auto k = read_key_now();
             if (!k) break;
@@ -694,32 +826,39 @@ int main() {
 
         if (auto key = poll_key()) {
             if (*key == 'Q') { running.store(false); break; }
-            if (*key == 'R') {
-                // Allow restart any time; commonly used after Game Over
-                game = new_game();
-                tick_ms = BASE_TICK_MS;
-                current_tick = chrono::milliseconds(tick_ms);
-            } else {
-                game.change_dir(*key); // returns bool; game tracks turns internally
+            else {
+                game.change_dir(*key);
+                steered_this_frame = true;
             }
         }
+        if (steered_this_frame) game.on_player_input();
 
         auto now = chrono::steady_clock::now();
         if (now >= next_tick) {
             while (now >= next_tick) {
+                game.speed_bump_trigger = false;
+                game.speed_bump_amount  = 0;
+
                 game.update();
 
-                // Speed up on level-up
-                if (game.level_up_trigger) {
-                    game.level_up_trigger = false;
-                    tick_ms = std::max(MIN_TICK_MS, tick_ms - TICK_DECR_MS);
-                    current_tick = chrono::milliseconds(tick_ms);
-                }
-                // Reward: reset to base speed when poop eaten
+                // Priority: reward slow-down overrides bumps this tick
                 if (game.slow_down_trigger) {
                     game.slow_down_trigger = false;
                     tick_ms = BASE_TICK_MS;
                     current_tick = chrono::milliseconds(tick_ms);
+                    game.speed_bump_trigger = false;
+                    game.speed_bump_amount  = 0;
+                } else {
+                    if (game.level_up_trigger) {
+                        game.level_up_trigger = false;
+                        tick_ms = std::max(MIN_TICK_MS, tick_ms - TICK_DECR_MS);
+                        current_tick = chrono::milliseconds(tick_ms);
+                    }
+                    if (game.speed_bump_trigger && game.speed_bump_amount > 0) {
+                        int total = GROW_DECR_MS * game.speed_bump_amount;
+                        tick_ms = std::max(MIN_TICK_MS, tick_ms - total);
+                        current_tick = chrono::milliseconds(tick_ms);
+                    }
                 }
 
                 next_tick += current_tick;

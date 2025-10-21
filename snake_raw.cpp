@@ -223,28 +223,33 @@ static void cinematic_splash_and_wait() {
 
     bool showed_image = false;
 
-    // --- iTerm2: inline PNG (OSC 1337), auto-fit width of terminal ---
+    // compute desired image width (in columns) and left padding
+    int cols = term_cols();
+    int img_cols = std::max(10, (cols * SPLASH_SCALE_PCT) / 100);
+    int pad = std::max(0, (cols - img_cols) / 2);
+
+    // --- iTerm2: inline PNG (OSC 1337), centered via left padding + width in cells ---
     if (!showed_image && is_iterm() && file_exists(SPLASH_PATH)) {
         std::string data;
         if (read_file(SPLASH_PATH, data)) {
             center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
             std::cout << "\n";
+
+            // print left padding spaces, then emit inline image at img_cols cell width
+            for (int i = 0; i < pad; ++i) std::cout << ' ';
             std::string b64 = b64_encode(data);
-            // width=100% keeps image within current viewport; aspect preserved
             std::cout << "\x1b]1337;File=name=splash.png;inline=1;width="
-            << SPLASH_SCALE_PCT << "%;preserveAspectRatio=1:"
-            << b64 << "\x07\n";
-        
+                      << img_cols << ";preserveAspectRatio=1:"  // width in terminal cells
+                      << b64 << "\x07\n";
             showed_image = true;
         }
     }
 
-    // --- kitty: inline PNG via icat, sized to current terminal area ---
+    // --- kitty: inline PNG via icat; use built-in centering and size from SPLASH_SCALE_PCT ---
     if (!showed_image && std::getenv("KITTY_WINDOW_ID") && have_cmd("kitty") && file_exists(SPLASH_PATH)) {
         showed_image = true;
-        int w = std::max(10, (term_cols() * SPLASH_SCALE_PCT) / 100);
-        int h = std::max(6,  (term_rows() * SPLASH_SCALE_PCT) / 100);
-
+        int w = img_cols;                              // columns
+        int h = std::max(6,  (term_rows() * SPLASH_SCALE_PCT) / 100); // rows, rough fit
         std::cout << "\x1b[2J\x1b[H";
         std::string cmd = "kitty +kitten icat --align center --place "
                         + std::to_string(w) + "x" + std::to_string(h) + "@0x0 '" + SPLASH_PATH + "'";
@@ -253,12 +258,12 @@ static void cinematic_splash_and_wait() {
         std::cout << "\n";
     }
 
-    // --- iTerm2 imgcat CLI (still inline), sized to current columns ---
+    // --- iTerm2 imgcat CLI (still inline). Center by padding, set width in columns ---
     if (!showed_image && is_iterm() && have_cmd("imgcat") && file_exists(SPLASH_PATH)) {
         showed_image = true;
-        int wcols = std::max(20, (term_cols() * SPLASH_SCALE_PCT) / 100);
         std::cout << "\x1b[2J\x1b[H";
-        std::string cmd = "imgcat --width=" + std::to_string(wcols) + " '" + SPLASH_PATH + "'";
+        for (int i = 0; i < pad; ++i) std::cout << ' ';
+        std::string cmd = "imgcat --width=" + std::to_string(img_cols) + " '" + SPLASH_PATH + "'";
         int rc = std::system(cmd.c_str());
         if (rc != 0) showed_image = false;
         center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
@@ -283,9 +288,9 @@ static void cinematic_splash_and_wait() {
                 ? std::string("\x1b[92m[ Press any key to continue ]\x1b[0m")
                 : std::string("\x1b[32m[ Press any key to continue ]\x1b[0m");
             int w = term_cols();
-            int pad = std::max(0, (int)(w - (int)msg.size()) / 2);
+            int pad2 = std::max(0, (int)(w - (int)msg.size()) / 2);
             std::cout << "\r";
-            for (int i = 0; i < pad; ++i) std::cout << ' ';
+            for (int i = 0; i < pad2; ++i) std::cout << ' ';
             std::cout << msg << std::flush;
         }
         std::this_thread::sleep_for(50ms);
@@ -293,6 +298,7 @@ static void cinematic_splash_and_wait() {
 
     std::cout << "\x1b[?25h\x1b[2J\x1b[H" << std::flush;
 }
+
 
 // ---------- Game model ----------
 struct Point { int r, c; };

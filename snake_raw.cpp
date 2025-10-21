@@ -473,53 +473,71 @@ struct Game {
     }
 
     void render() const {
-        cout << "\x1b[2J\x1b[H";
-        cout << '+';
-        for (int c = 0; c < COLS; ++c) cout << '-';
-        cout << "+  Score: " << score
-             << (consuming ? "   (CHOMP!)" : "")
-             << (poop_to_drop > 0 ? "   (Dropping...)" : "")
-             << "\n";
+    // how many spaces to pad so the box (COLS+2 wide including borders) is centered
+    int box_width = COLS + 2;
+    int pad = std::max(0, (term_cols() - box_width) / 2);
 
-        for (int r = 0; r < ROWS; ++r) {
-            cout << '|';
-            cout << BG_BLUE << FG_WHITE;
+    cout << "\x1b[2J\x1b[H";
 
-            for (int c = 0; c < COLS; ++c) {
-                const char* overlayGlyph = nullptr;
-                if (pac_overlay(r, c, overlayGlyph)) {
-                    cout << FG_BRIGHT_GREEN << overlayGlyph << FG_WHITE;
-                    continue;
-                }
-                if (food.r == r && food.c == c) {
-                    cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
-                    continue;
-                }
-                bool on_snake = false;
-                for (const auto& seg : snake) {
-                    if (seg.r == r && seg.c == c) { on_snake = true; break; }
-                }
-                if (on_snake) {
-                    cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
-                    continue;
-                }
-                if (cell_has_poop(r, c)) {
-                    cout << FG_BROWN_256 << "●" << FG_WHITE;
-                } else {
-                    cout << ' ';
-                }
+    // centered score/status line
+    {
+        std::string status = "Score: " + std::to_string(score);
+        if (consuming)    status += "   (CHOMP!)";
+        if (poop_to_drop) status += "   (Dropping...)";
+        center_line(status);
+    }
+
+    // top border, centered
+    for (int i = 0; i < pad; ++i) cout << ' ';
+    cout << '+';
+    for (int c = 0; c < COLS; ++c) cout << '-';
+    cout << "+\n";
+
+    // rows, centered
+    for (int r = 0; r < ROWS; ++r) {
+        for (int i = 0; i < pad; ++i) cout << ' ';
+        cout << '|';
+        cout << BG_BLUE << FG_WHITE;
+
+        for (int c = 0; c < COLS; ++c) {
+            const char* overlayGlyph = nullptr;
+            if (pac_overlay(r, c, overlayGlyph)) {
+                cout << FG_BRIGHT_GREEN << overlayGlyph << FG_WHITE;
+                continue;
             }
-
-            cout << RESET << "|\n";
+            if (food.r == r && food.c == c) {
+                cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
+                continue;
+            }
+            bool on_snake = false;
+            for (const auto& seg : snake) {
+                if (seg.r == r && seg.c == c) { on_snake = true; break; }
+            }
+            if (on_snake) {
+                cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
+            } else if (cell_has_poop(r, c)) {
+                cout << FG_BROWN_256 << "●" << FG_WHITE;
+            } else {
+                cout << ' ';
+            }
         }
 
-        cout << '+';
-        for (int c = 0; c < COLS; ++c) cout << '-';
-        cout << "+\n";
-        cout << "W/A/S/D to move, Q to quit.\n";
-        if (game_over) cout << "Game Over. Press Q to exit.\n";
-        cout.flush();
+        cout << RESET << "|\n";
     }
+
+    // bottom border, centered
+    for (int i = 0; i < pad; ++i) cout << ' ';
+    cout << '+';
+    for (int c = 0; c < COLS; ++c) cout << '-';
+    cout << "+\n";
+
+    // centered controls/help
+    center_line("W/A/S/D to move, Q to quit.");
+    if (game_over) center_line("Game Over. Press Q to exit.");
+
+    cout.flush();
+}
+
 };
 
 int main() {

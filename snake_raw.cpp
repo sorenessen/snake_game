@@ -1,9 +1,13 @@
 // snake_raw.cpp — macOS-friendly console Snake with raw keyboard input
 // Poop → Bomb (harmless if eaten) system, with BIG emoji head while chomping
+// + Floating text: when a poop activates, “NICE SHIT!” rises up from it.
+//
 // - 0–15s: Good poop (brown ●). Eat it: slow to base & shrink up to 2.
 // - 15–30s: Arms into a flashing red bomb (✹). If you EAT it → neutralize (no penalty).
 // - 30s: If it EXPIRES (you didn't reach it), it despawns and queues +2 growth (mild punishment).
 // Big chomp: while eating, the head becomes a single wide round emoji (🟢) and then returns to normal.
+// Floating text: on poop activation (tail vacates), show “NICE SHIT!” rising for ~2s.
+//
 // Kept:
 // - Blue field, green snake (●), yellow food (●)
 // - Poop seeds under tail; 3 drops per food
@@ -324,6 +328,16 @@ struct Explosion {
     std::vector<Point> ring;
 };
 
+// Floating text particle: rises upward and fades
+struct FloatText {
+    std::string msg;
+    int row;            // current row in playfield (0..ROWS-1)
+    int col_start;      // starting column for msg (0..COLS-1)
+    int age{0};         // ticks since spawn
+    int life{20};       // total ticks to live (~2s at base speed)
+    int step{3};        // rise one row every 'step' ticks
+};
+
 struct Game {
     deque<Point> snake; // front=head
     Dir dir = Dir::Right;
@@ -341,6 +355,9 @@ struct Game {
     vector<Poop>  poops;
     vector<Point> poop_seeds;
     vector<Explosion> booms;
+
+    // Floaters (NICE SHIT!)
+    vector<FloatText> floats;
 
     int growth_pending = 0;    // queued growth (penalties)
     int level = 1;
@@ -478,6 +495,16 @@ struct Game {
                     booms.end());
     }
 
+    void tick_float_texts() {
+        for (auto &ft : floats) {
+            ft.age++;
+            if (ft.age % ft.step == 0 && ft.row > 0) ft.row--;  // rise
+        }
+        floats.erase(remove_if(floats.begin(), floats.end(),
+                               [](const FloatText& f){ return f.age >= f.life || f.row < 0; }),
+                     floats.end());
+    }
+
     bool cell_on_snake(int rr, int cc) const {
         for (const auto& seg : snake) if (seg.r == rr && seg.c == cc) return true;
         return false;
@@ -503,6 +530,12 @@ struct Game {
                 Poop pp; pp.p = s; pp.activated_at = now; pp.state = PoopState::Good; pp.expired_punished = false;
                 poops.push_back(pp);
                 play_system_sound(FART_SOUND);
+
+                // Spawn floating “NICE SHIT!” over this poop, centered
+                std::string msg = "NICE SHIT!";
+                int len = (int)msg.size();
+                int c0 = std::max(0, std::min(COLS - len, s.c - len/2));
+                floats.push_back(FloatText{msg, s.r, c0, 0, 20, 3});
             } else {
                 remaining.push_back(s);
             }
@@ -516,6 +549,7 @@ struct Game {
         tick_poop_lifecycle();
         maybe_activate_poops();
         decay_booms();
+        tick_float_texts();
 
         if (level_flash  > 0) level_flash--;
         if (reward_flash > 0) reward_flash--;
@@ -631,6 +665,20 @@ struct Game {
         return false;
     }
 
+    // Check if a floating text overlays this cell; if yes, print its character and return true.
+    bool draw_float_at(int rr, int cc) const {
+        for (const auto& ft : floats) {
+            if (rr != ft.row) continue;
+            int len = (int)ft.msg.size();
+            if (cc >= ft.col_start && cc < ft.col_start + len) {
+                char ch = ft.msg[cc - ft.col_start];
+                std::cout << FG_BRIGHT_YELLOW << ch << FG_WHITE;
+                return true;
+            }
+        }
+        return false;
+    }
+
     void render() const {
         int box_width = COLS + 2;
         int pad = std::max(0, (term_cols() - box_width) / 2);
@@ -669,7 +717,10 @@ struct Game {
             cout << BG_BLUE << FG_WHITE;
 
             for (int c = 0; c < COLS; ++c) {
-                // explosions
+                // 1) Floating text overlays everything
+                if (draw_float_at(r, c)) continue;
+
+                // 2) Explosions
                 bool drew_boom = false;
                 for (const auto &b : booms) {
                     if ((r == b.center.r && c == b.center.c)) {
@@ -687,27 +738,27 @@ struct Game {
                 }
                 if (drew_boom) continue;
 
-                // Big head (double-width emoji). Skip the next column we occupy.
+                // 3) Big head (double-width emoji)
                 if (show_wide_head && r == head.r && c == head.c) {
                     std::cout << WIDE_HEAD;
-                    ++c; // skip the next cell because emoji is double-width
+                    ++c; // skip next cell
                     continue;
                 }
 
-                // Food
+                // 4) Food
                 if (food.r == r && food.c == c) {
                     cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
                     continue;
                 }
 
-                // Head (normal when not wide)
+                // 5) Head (normal)
                 if ((!show_wide_head || r != head.r || c != head.c) &&
                     r == head.r && c == head.c) {
                     cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
                     continue;
                 }
 
-                // Body
+                // 6) Body
                 bool on_body = false;
                 for (size_t i = 1; i < snake.size(); ++i) {
                     if (snake[i].r == r && snake[i].c == c) { on_body = true; break; }
@@ -717,7 +768,7 @@ struct Game {
                     continue;
                 }
 
-                // poop / bomb
+                // 7) Poop / Bomb
                 PoopState st;
                 if (cell_has_good_or_bomb(r, c, &st)) {
                     if (st == PoopState::Good) {

@@ -1,11 +1,11 @@
 // snake_raw.cpp — macOS-friendly console Snake with raw keyboard input
 // Features:
-// - Blue playfield, green snake ("●"), yellow food ("●")
-// - Pac-Man-ish gulp overlay when eating, plus score increment
+// - Centered playfield; blue interior, green snake ("●"), yellow food ("●")
+// - Pac-Man-ish gulp overlay when eating (round head overlay)
 // - Poop trail: 3 brown dots after each eat, fading over time
 // - Sounds: randomized bite (Pop/Bottle/Funk/Tink/Ping), "Submarine" on poop
-// - Splash: inline PNG if kitty/iTerm2 supports it; otherwise colored ASCII splash
-//   (No external Preview/Quick Look window; stays inside terminal)
+// - Splash: inline PNG if kitty/iTerm2 supports it; else colored ASCII splash
+// - LEVEL UP: every +100 points → screen blink + banner + faster speed
 
 #include <algorithm>
 #include <atomic>
@@ -35,8 +35,9 @@ static constexpr bool ENABLE_SOUNDS = true;
 static constexpr bool ENABLE_BEEP_FALLBACK = false;
 
 static const char* BITE_SOUNDS[] = { "Pop", "Bottle", "Funk", "Tink", "Ping" };
-static constexpr const char* FART_SOUND   = "Submarine";
-static constexpr const char* SPLASH_SOUND = "Purr"; // soft hiss/rumble
+static constexpr const char* FART_SOUND    = "Submarine";
+static constexpr const char* SPLASH_SOUND  = "Purr";   // soft hiss/rumble
+static constexpr const char* LEVELUP_SOUND = "Ping";   // feedback on level up
 
 static inline void play_system_sound(const char* name) {
     if (!ENABLE_SOUNDS || name == nullptr) return;
@@ -59,11 +60,13 @@ static constexpr const char* FG_BROWN_256     = "\x1b[38;5;130m";
 static constexpr const char* FG_GRAY          = "\x1b[90m";
 static constexpr const char* FG_GREEN         = "\x1b[32m";
 
-// ---------- Config ----------
+// ---------- Game + timing config ----------
 static constexpr int ROWS = 20;
 static constexpr int COLS = 80;
-static constexpr chrono::milliseconds TICK{100}; // 10 FPS
-static constexpr int POOP_TTL = 12;              // poop fades
+static constexpr int BASE_TICK_MS = 100; // start speed (10 FPS)
+static constexpr int MIN_TICK_MS  = 30;  // cap (~33 FPS)
+static constexpr int TICK_DECR_MS = 15;  // faster by 15ms each level-up
+static constexpr int POOP_TTL     = 12;  // poop fades
 
 // ---------- Raw terminal guard ----------
 struct RawTerm {
@@ -187,7 +190,7 @@ static bool is_iterm() { return std::getenv("ITERM_SESSION_ID") != nullptr; }
 
 // ---------- Splash ----------
 static constexpr const char* SPLASH_PATH = "assets/splash.png";
-static constexpr int SPLASH_SCALE_PCT = 40; // make image ~40% of terminal width/area
+static constexpr int SPLASH_SCALE_PCT = 40; // splash width ~= 40% of terminal columns
 
 static void ascii_splash_art() {
     const char* G  = "\x1b[92m";   // green
@@ -234,8 +237,6 @@ static void cinematic_splash_and_wait() {
         if (read_file(SPLASH_PATH, data)) {
             center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
             std::cout << "\n";
-
-            // print left padding spaces, then emit inline image at img_cols cell width
             for (int i = 0; i < pad; ++i) std::cout << ' ';
             std::string b64 = b64_encode(data);
             std::cout << "\x1b]1337;File=name=splash.png;inline=1;width="
@@ -245,11 +246,11 @@ static void cinematic_splash_and_wait() {
         }
     }
 
-    // --- kitty: inline PNG via icat; use built-in centering and size from SPLASH_SCALE_PCT ---
+    // --- kitty: inline PNG via icat; centered by kitty, size via SCALE_PCT ---
     if (!showed_image && std::getenv("KITTY_WINDOW_ID") && have_cmd("kitty") && file_exists(SPLASH_PATH)) {
         showed_image = true;
         int w = img_cols;                              // columns
-        int h = std::max(6,  (term_rows() * SPLASH_SCALE_PCT) / 100); // rows, rough fit
+        int h = std::max(6,  (term_rows() * SPLASH_SCALE_PCT) / 100); // rows
         std::cout << "\x1b[2J\x1b[H";
         std::string cmd = "kitty +kitten icat --align center --place "
                         + std::to_string(w) + "x" + std::to_string(h) + "@0x0 '" + SPLASH_PATH + "'";
@@ -258,7 +259,7 @@ static void cinematic_splash_and_wait() {
         std::cout << "\n";
     }
 
-    // --- iTerm2 imgcat CLI (still inline). Center by padding, set width in columns ---
+    // --- iTerm2 imgcat CLI (still inline). Center by padding, width in columns ---
     if (!showed_image && is_iterm() && have_cmd("imgcat") && file_exists(SPLASH_PATH)) {
         showed_image = true;
         std::cout << "\x1b[2J\x1b[H";
@@ -299,7 +300,6 @@ static void cinematic_splash_and_wait() {
     std::cout << "\x1b[?25h\x1b[2J\x1b[H" << std::flush;
 }
 
-
 // ---------- Game model ----------
 struct Point { int r, c; };
 enum class Dir { Up, Down, Left, Right };
@@ -320,6 +320,11 @@ struct Game {
     // Poop
     int poop_to_drop = 0;
     vector<Poop> poops;
+
+    // Level-up state
+    int level = 1;
+    int level_flash = 0;           // frames to blink screen/message
+    bool level_up_trigger = false; // consumed in main() to change speed
 
     mt19937 rng{random_device{}()};
 
@@ -384,6 +389,7 @@ struct Game {
         if (game_over) return;
 
         decay_poops();
+        if (level_flash > 0) level_flash--;
 
         if (consuming) {
             if (--chomp_frames <= 0) {
@@ -395,6 +401,14 @@ struct Game {
                 snake.push_front(nh); // grow
                 score += 10;
 
+                // Check level-up every 100 points
+                if (score % 100 == 0) {
+                    level++;
+                    level_flash = 12;        // ~1.2s at 10 FPS baseline
+                    level_up_trigger = true; // let main() adjust speed
+                    play_system_sound(LEVELUP_SOUND);
+                }
+
                 play_random_bite_sound(rng);
                 poop_to_drop = 3;
 
@@ -404,8 +418,7 @@ struct Game {
             return;
         }
 
-        Point head = snake.front();
-        Point nh = next_head(head);
+        Point nh = next_head(snake.front());
 
         if (nh.r == food.r && nh.c == food.c) {
             consuming = true;
@@ -479,71 +492,82 @@ struct Game {
     }
 
     void render() const {
-    // how many spaces to pad so the box (COLS+2 wide including borders) is centered
-    int box_width = COLS + 2;
-    int pad = std::max(0, (term_cols() - box_width) / 2);
+        // center the whole box laterally
+        int box_width = COLS + 2;
+        int pad = std::max(0, (term_cols() - box_width) / 2);
 
-    cout << "\x1b[2J\x1b[H";
-
-    // centered score/status line
-    {
-        std::string status = "Score: " + std::to_string(score);
-        if (consuming)    status += "   (CHOMP!)";
-        if (poop_to_drop) status += "   (Dropping...)";
-        center_line(status);
-    }
-
-    // top border, centered
-    for (int i = 0; i < pad; ++i) cout << ' ';
-    cout << '+';
-    for (int c = 0; c < COLS; ++c) cout << '-';
-    cout << "+\n";
-
-    // rows, centered
-    for (int r = 0; r < ROWS; ++r) {
-        for (int i = 0; i < pad; ++i) cout << ' ';
-        cout << '|';
-        cout << BG_BLUE << FG_WHITE;
-
-        for (int c = 0; c < COLS; ++c) {
-            const char* overlayGlyph = nullptr;
-            if (pac_overlay(r, c, overlayGlyph)) {
-                cout << FG_BRIGHT_GREEN << overlayGlyph << FG_WHITE;
-                continue;
-            }
-            if (food.r == r && food.c == c) {
-                cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
-                continue;
-            }
-            bool on_snake = false;
-            for (const auto& seg : snake) {
-                if (seg.r == r && seg.c == c) { on_snake = true; break; }
-            }
-            if (on_snake) {
-                cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
-            } else if (cell_has_poop(r, c)) {
-                cout << FG_BROWN_256 << "●" << FG_WHITE;
-            } else {
-                cout << ' ';
-            }
+        // quick screen flash on level-up: reverse-video pulses
+        if (level_flash > 0 && ((level_flash / 2) % 2 == 0)) {
+            cout << "\x1b[7m";  // reverse video ON
+        } else {
+            cout << "\x1b[27m"; // reverse video OFF
         }
 
-        cout << RESET << "|\n";
+        cout << "\x1b[2J\x1b[H";
+
+        // centered score/status line
+        {
+            std::string status = "Score: " + std::to_string(score) + "   Level: " + std::to_string(level);
+            if (consuming)    status += "   (CHOMP!)";
+            if (poop_to_drop) status += "   (Dropping...)";
+            center_line(status);
+        }
+
+        // top border
+        for (int i = 0; i < pad; ++i) cout << ' ';
+        cout << '+';
+        for (int c = 0; c < COLS; ++c) cout << '-';
+        cout << "+\n";
+
+        // rows
+        for (int r = 0; r < ROWS; ++r) {
+            for (int i = 0; i < pad; ++i) cout << ' ';
+            cout << '|';
+            cout << BG_BLUE << FG_WHITE;
+
+            for (int c = 0; c < COLS; ++c) {
+                const char* overlayGlyph = nullptr;
+                if (pac_overlay(r, c, overlayGlyph)) {
+                    cout << FG_BRIGHT_GREEN << overlayGlyph << FG_WHITE;
+                    continue;
+                }
+                if (food.r == r && food.c == c) {
+                    cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
+                    continue;
+                }
+                bool on_snake = false;
+                for (const auto& seg : snake) {
+                    if (seg.r == r && seg.c == c) { on_snake = true; break; }
+                }
+                if (on_snake) {
+                    cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
+                } else if (cell_has_poop(r, c)) {
+                    cout << FG_BROWN_256 << "●" << FG_WHITE;
+                } else {
+                    cout << ' ';
+                }
+            }
+
+            cout << RESET << "|\n";
+        }
+
+        // bottom border
+        for (int i = 0; i < pad; ++i) cout << ' ';
+        cout << '+';
+        for (int c = 0; c < COLS; ++c) cout << '-';
+        cout << "+\n";
+
+        // controls/help
+        center_line("W/A/S/D to move, Q to quit.");
+        if (game_over) center_line("Game Over. Press Q to exit.");
+
+        // level-up banner while flashing
+        if (level_flash > 0) {
+            center_line("\x1b[1m\x1b[93mLEVEL UP!  Speed increased\x1b[0m");
+        }
+
+        cout.flush();
     }
-
-    // bottom border, centered
-    for (int i = 0; i < pad; ++i) cout << ' ';
-    cout << '+';
-    for (int c = 0; c < COLS; ++c) cout << '-';
-    cout << "+\n";
-
-    // centered controls/help
-    center_line("W/A/S/D to move, Q to quit.");
-    if (game_over) center_line("Game Over. Press Q to exit.");
-
-    cout.flush();
-}
-
 };
 
 int main() {
@@ -552,10 +576,13 @@ int main() {
 
     RawTerm raw;
 
-    // Inline PNG if supported (kitty/iTerm2), else colored ASCII — all inside terminal
+    // Splash inside terminal (PNG if supported, else ASCII)
     cinematic_splash_and_wait();
 
     Game game;
+
+    int tick_ms = BASE_TICK_MS;
+    auto current_tick = chrono::milliseconds(tick_ms);
     auto next_tick = chrono::steady_clock::now();
 
     while (running.load()) {
@@ -576,7 +603,15 @@ int main() {
         if (now >= next_tick) {
             while (now >= next_tick) {
                 game.update();
-                next_tick += TICK;
+
+                // respond to level-up: speed up (every 100 points)
+                if (game.level_up_trigger) {
+                    game.level_up_trigger = false;
+                    tick_ms = std::max(MIN_TICK_MS, tick_ms - TICK_DECR_MS);
+                    current_tick = chrono::milliseconds(tick_ms);
+                }
+
+                next_tick += current_tick;
             }
             game.render();
         } else {
@@ -617,6 +652,8 @@ int main() {
 // #include <unistd.h>
 // #include <cstdlib>
 // #include <sys/stat.h>
+// #include <sys/ioctl.h>
+// #include <cstdio>
 
 // using namespace std;
 
@@ -699,7 +736,7 @@ int main() {
 //     return c;
 // }
 
-// // ---------- Small helpers ----------
+// // ---------- Helpers ----------
 // static bool have_cmd(const char* name) {
 //     std::string cmd = "command -v ";
 //     cmd += name;
@@ -709,43 +746,29 @@ int main() {
 // static bool file_exists(const char* p) {
 //     struct stat st{}; return ::stat(p, &st) == 0 && S_ISREG(st.st_mode);
 // }
+// static bool env_set(const char* name) { return std::getenv(name) != nullptr; }
+
+// // live terminal size (columns/rows)
+// static int term_cols() {
+//     winsize ws{};
+//     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
+//     return COLS; // fallback
+// }
+// static int term_rows() {
+//     winsize ws{};
+//     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
+//     return ROWS + 6; // slack for title/prompt
+// }
+
+// // centered print using current terminal width
 // static void center_line(const std::string& s) {
-//     int w = COLS; int pad = std::max(0, (int)(w - (int)s.size()) / 2);
+//     int w = term_cols();
+//     int pad = std::max(0, (int)(w - (int)s.size()) / 2);
 //     for (int i = 0; i < pad; ++i) std::cout << ' ';
 //     std::cout << s << "\n";
 // }
-// static bool env_set(const char* name) { return std::getenv(name) != nullptr; }
 
-// // ---------- Splash (inline PNG if kitty/iTerm2; else ASCII) ----------
-// static constexpr const char* SPLASH_PATH = "assets/splash.png";
-
-// static void ascii_splash_art() {
-//     const char* G  = "\x1b[92m";   // green
-//     const char* Y  = "\x1b[93m";   // yellow
-//     const char* R  = "\x1b[91m";   // red
-//     const char* Wt = "\x1b[97m";   // white
-//     const char* Br = "\x1b[38;5;130m"; // brown
-//     const char* Rt = "\x1b[0m";
-//     std::vector<std::string> art = {
-//         std::string(G) + "           ________                          " + Rt,
-//         std::string(G) + "        .-`  ____  `-.                       " + Rt,
-//         std::string(G) + "      .'   .`    `.   `.                     " + Rt,
-//         std::string(G) + "     /   .'   " + R + "◥◤" + G + "   `.   \\                    " + Rt,
-//         std::string(G) + "    ;   /    " + Wt + " __ __ " + G + "   \\   ;                   " + Rt,
-//         std::string(G) + "    |  |   " + Wt + " /__V__\\ " + G + "  |  |   " + Y + "   ●" + Rt,
-//         std::string(G) + "    |  |  " + R + "  \\____/ " + G + "  " + R + "\\/" + G + " |  |   " + Br + "  ● ● ●" + Rt,
-//         std::string(G) + "    ;   \\      " + R + "┏━┓" + G + "      /   ;   " + Br + "  ●●● ●●●" + Rt,
-//         std::string(G) + "     \\    `._ " + Wt + "V  V" + G + "  _.'   /                    " + Rt,
-//         std::string(G) + "      `.     `-.__.-'     .'                 " + Rt,
-//         std::string(G) + "        `-._            _.-'                  " + Rt
-//     };
-//     center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
-//     std::cout << "\n";
-//     for (auto& line : art) center_line(line);
-//     std::cout << "\n";
-// }
-
-// // --- tiny file->string and base64 for iTerm2 inline image ---
+// // tiny file->string and base64 for iTerm2 inline image (OSC 1337)
 // static bool read_file(const char* path, std::string& out) {
 //     FILE* f = std::fopen(path, "rb");
 //     if (!f) return false;
@@ -787,30 +810,37 @@ int main() {
 //     }
 //     return out;
 // }
-
-// #include <sys/ioctl.h>
-
-// // live terminal size (columns/rows)
-// static int term_cols() {
-//     winsize ws{};
-//     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
-//     return COLS; // fallback to your compiled-in width
-// }
-// static int term_rows() {
-//     winsize ws{};
-//     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
-//     return ROWS + 6; // bit of slack for borders/title
-// }
-
-// // centered print using current terminal width
-// static void center_line(const std::string& s) {
-//     int w = term_cols();
-//     int pad = std::max(0, (int)(w - (int)s.size()) / 2);
-//     for (int i = 0; i < pad; ++i) std::cout << ' ';
-//     std::cout << s << "\n";
-// }
-
 // static bool is_iterm() { return std::getenv("ITERM_SESSION_ID") != nullptr; }
+
+// // ---------- Splash ----------
+// static constexpr const char* SPLASH_PATH = "assets/splash.png";
+// static constexpr int SPLASH_SCALE_PCT = 40; // make image ~40% of terminal width/area
+
+// static void ascii_splash_art() {
+//     const char* G  = "\x1b[92m";   // green
+//     const char* Y  = "\x1b[93m";   // yellow
+//     const char* R  = "\x1b[91m";   // red
+//     const char* Wt = "\x1b[97m";   // white
+//     const char* Br = "\x1b[38;5;130m"; // brown
+//     const char* Rt = "\x1b[0m";
+//     std::vector<std::string> art = {
+//         std::string(G) + "           ________                          " + Rt,
+//         std::string(G) + "        .-`  ____  `-.                       " + Rt,
+//         std::string(G) + "      .'   .`    `.   `.                     " + Rt,
+//         std::string(G) + "     /   .'   " + R + "◥◤" + G + "   `.   \\                    " + Rt,
+//         std::string(G) + "    ;   /    " + Wt + " __ __ " + G + "   \\   ;                   " + Rt,
+//         std::string(G) + "    |  |   " + Wt + " /__V__\\ " + G + "  |  |   " + Y + "   ●" + Rt,
+//         std::string(G) + "    |  |  " + R + "  \\____/ " + G + "  " + R + "\\/" + G + " |  |   " + Br + "  ● ● ●" + Rt,
+//         std::string(G) + "    ;   \\      " + R + "┏━┓" + G + "      /   ;   " + Br + "  ●●● ●●●" + Rt,
+//         std::string(G) + "     \\    `._ " + Wt + "V  V" + G + "  _.'   /                    " + Rt,
+//         std::string(G) + "      `.     `-.__.-'     .'                 " + Rt,
+//         std::string(G) + "        `-._            _.-'                  " + Rt
+//     };
+//     center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+//     std::cout << "\n";
+//     for (auto& line : art) center_line(line);
+//     std::cout << "\n";
+// }
 
 // static void cinematic_splash_and_wait() {
 //     using namespace std::chrono;
@@ -820,28 +850,34 @@ int main() {
 
 //     bool showed_image = false;
 
-//     // --- iTerm2: draw PNG inline, scaled to terminal width (100% of columns) ---
-//     if (!showed_image && std::getenv("ITERM_SESSION_ID") && file_exists(SPLASH_PATH)) {
+//     // compute desired image width (in columns) and left padding
+//     int cols = term_cols();
+//     int img_cols = std::max(10, (cols * SPLASH_SCALE_PCT) / 100);
+//     int pad = std::max(0, (cols - img_cols) / 2);
+
+//     // --- iTerm2: inline PNG (OSC 1337), centered via left padding + width in cells ---
+//     if (!showed_image && is_iterm() && file_exists(SPLASH_PATH)) {
 //         std::string data;
 //         if (read_file(SPLASH_PATH, data)) {
-//             // Fit width to terminal, preserve aspect
 //             center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
 //             std::cout << "\n";
+
+//             // print left padding spaces, then emit inline image at img_cols cell width
+//             for (int i = 0; i < pad; ++i) std::cout << ' ';
 //             std::string b64 = b64_encode(data);
-//             // width in %, iTerm scales to viewport; use 100% to always fit
-//             std::cout << "\x1b]1337;File=name=splash.png;inline=1;width=100%;preserveAspectRatio=1:"
+//             std::cout << "\x1b]1337;File=name=splash.png;inline=1;width="
+//                       << img_cols << ";preserveAspectRatio=1:"  // width in terminal cells
 //                       << b64 << "\x07\n";
 //             showed_image = true;
 //         }
 //     }
 
-//     // --- kitty: place image to fill available cells while centered ---
+//     // --- kitty: inline PNG via icat; use built-in centering and size from SPLASH_SCALE_PCT ---
 //     if (!showed_image && std::getenv("KITTY_WINDOW_ID") && have_cmd("kitty") && file_exists(SPLASH_PATH)) {
 //         showed_image = true;
-//         int w = std::max(10, term_cols() - 2);              // leave a small margin
-//         int h = std::max(6,  term_rows() - 8);              // room for title + prompt
+//         int w = img_cols;                              // columns
+//         int h = std::max(6,  (term_rows() * SPLASH_SCALE_PCT) / 100); // rows, rough fit
 //         std::cout << "\x1b[2J\x1b[H";
-//         // --place WxH@0x0 paints into the grid; --align center keeps it centered
 //         std::string cmd = "kitty +kitten icat --align center --place "
 //                         + std::to_string(w) + "x" + std::to_string(h) + "@0x0 '" + SPLASH_PATH + "'";
 //         (void)std::system(cmd.c_str());
@@ -849,25 +885,25 @@ int main() {
 //         std::cout << "\n";
 //     }
 
-//     // --- iTerm2 imgcat CLI fallback (still inside terminal) ---
-//     if (!showed_image && std::getenv("ITERM_SESSION_ID") && have_cmd("imgcat") && file_exists(SPLASH_PATH)) {
+//     // --- iTerm2 imgcat CLI (still inline). Center by padding, set width in columns ---
+//     if (!showed_image && is_iterm() && have_cmd("imgcat") && file_exists(SPLASH_PATH)) {
 //         showed_image = true;
-//         int wcols = std::max(20, term_cols() - 4); // fit viewport, small margins
 //         std::cout << "\x1b[2J\x1b[H";
-//         std::string cmd = "imgcat --width=" + std::to_string(wcols) + " '" + SPLASH_PATH + "'";
+//         for (int i = 0; i < pad; ++i) std::cout << ' ';
+//         std::string cmd = "imgcat --width=" + std::to_string(img_cols) + " '" + SPLASH_PATH + "'";
 //         int rc = std::system(cmd.c_str());
 //         if (rc != 0) showed_image = false;
 //         center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
 //         std::cout << "\n";
 //     }
 
-//     // --- Fallback: ANSI art (always fits + centered using term_cols) ---
+//     // --- Fallback: centered ASCII splash ---
 //     if (!showed_image) {
 //         std::cout << "\x1b[2J\x1b[H";
-//         ascii_splash_art(); // uses center_line() which now reads term width live
+//         ascii_splash_art();
 //     }
 
-//     // Pulsing centered prompt (uses live width)
+//     // Pulsing centered prompt (re-centers if user resizes)
 //     bool bright = true;
 //     auto last = std::chrono::steady_clock::now();
 //     while (true) {
@@ -878,11 +914,10 @@ int main() {
 //             std::string msg = bright
 //                 ? std::string("\x1b[92m[ Press any key to continue ]\x1b[0m")
 //                 : std::string("\x1b[32m[ Press any key to continue ]\x1b[0m");
-//             // re-center each flash in case the user resizes during splash
 //             int w = term_cols();
-//             int pad = std::max(0, (int)(w - (int)msg.size()) / 2);
+//             int pad2 = std::max(0, (int)(w - (int)msg.size()) / 2);
 //             std::cout << "\r";
-//             for (int i = 0; i < pad; ++i) std::cout << ' ';
+//             for (int i = 0; i < pad2; ++i) std::cout << ' ';
 //             std::cout << msg << std::flush;
 //         }
 //         std::this_thread::sleep_for(50ms);
@@ -890,7 +925,6 @@ int main() {
 
 //     std::cout << "\x1b[?25h\x1b[2J\x1b[H" << std::flush;
 // }
-
 
 
 // // ---------- Game model ----------
@@ -1072,53 +1106,71 @@ int main() {
 //     }
 
 //     void render() const {
-//         cout << "\x1b[2J\x1b[H";
-//         cout << '+';
-//         for (int c = 0; c < COLS; ++c) cout << '-';
-//         cout << "+  Score: " << score
-//              << (consuming ? "   (CHOMP!)" : "")
-//              << (poop_to_drop > 0 ? "   (Dropping...)" : "")
-//              << "\n";
+//     // how many spaces to pad so the box (COLS+2 wide including borders) is centered
+//     int box_width = COLS + 2;
+//     int pad = std::max(0, (term_cols() - box_width) / 2);
 
-//         for (int r = 0; r < ROWS; ++r) {
-//             cout << '|';
-//             cout << BG_BLUE << FG_WHITE;
+//     cout << "\x1b[2J\x1b[H";
 
-//             for (int c = 0; c < COLS; ++c) {
-//                 const char* overlayGlyph = nullptr;
-//                 if (pac_overlay(r, c, overlayGlyph)) {
-//                     cout << FG_BRIGHT_GREEN << overlayGlyph << FG_WHITE;
-//                     continue;
-//                 }
-//                 if (food.r == r && food.c == c) {
-//                     cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
-//                     continue;
-//                 }
-//                 bool on_snake = false;
-//                 for (const auto& seg : snake) {
-//                     if (seg.r == r && seg.c == c) { on_snake = true; break; }
-//                 }
-//                 if (on_snake) {
-//                     cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
-//                     continue;
-//                 }
-//                 if (cell_has_poop(r, c)) {
-//                     cout << FG_BROWN_256 << "●" << FG_WHITE;
-//                 } else {
-//                     cout << ' ';
-//                 }
+//     // centered score/status line
+//     {
+//         std::string status = "Score: " + std::to_string(score);
+//         if (consuming)    status += "   (CHOMP!)";
+//         if (poop_to_drop) status += "   (Dropping...)";
+//         center_line(status);
+//     }
+
+//     // top border, centered
+//     for (int i = 0; i < pad; ++i) cout << ' ';
+//     cout << '+';
+//     for (int c = 0; c < COLS; ++c) cout << '-';
+//     cout << "+\n";
+
+//     // rows, centered
+//     for (int r = 0; r < ROWS; ++r) {
+//         for (int i = 0; i < pad; ++i) cout << ' ';
+//         cout << '|';
+//         cout << BG_BLUE << FG_WHITE;
+
+//         for (int c = 0; c < COLS; ++c) {
+//             const char* overlayGlyph = nullptr;
+//             if (pac_overlay(r, c, overlayGlyph)) {
+//                 cout << FG_BRIGHT_GREEN << overlayGlyph << FG_WHITE;
+//                 continue;
 //             }
-
-//             cout << RESET << "|\n";
+//             if (food.r == r && food.c == c) {
+//                 cout << FG_BRIGHT_YELLOW << "●" << FG_WHITE;
+//                 continue;
+//             }
+//             bool on_snake = false;
+//             for (const auto& seg : snake) {
+//                 if (seg.r == r && seg.c == c) { on_snake = true; break; }
+//             }
+//             if (on_snake) {
+//                 cout << FG_BRIGHT_GREEN << "●" << FG_WHITE;
+//             } else if (cell_has_poop(r, c)) {
+//                 cout << FG_BROWN_256 << "●" << FG_WHITE;
+//             } else {
+//                 cout << ' ';
+//             }
 //         }
 
-//         cout << '+';
-//         for (int c = 0; c < COLS; ++c) cout << '-';
-//         cout << "+\n";
-//         cout << "W/A/S/D to move, Q to quit.\n";
-//         if (game_over) cout << "Game Over. Press Q to exit.\n";
-//         cout.flush();
+//         cout << RESET << "|\n";
 //     }
+
+//     // bottom border, centered
+//     for (int i = 0; i < pad; ++i) cout << ' ';
+//     cout << '+';
+//     for (int c = 0; c < COLS; ++c) cout << '-';
+//     cout << "+\n";
+
+//     // centered controls/help
+//     center_line("W/A/S/D to move, Q to quit.");
+//     if (game_over) center_line("Game Over. Press Q to exit.");
+
+//     cout.flush();
+// }
+
 // };
 
 // int main() {

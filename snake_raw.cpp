@@ -25,6 +25,8 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <cstdio>
 
 using namespace std;
 
@@ -107,7 +109,7 @@ optional<char> poll_key() {
     return c;
 }
 
-// ---------- Small helpers ----------
+// ---------- Helpers ----------
 static bool have_cmd(const char* name) {
     std::string cmd = "command -v ";
     cmd += name;
@@ -117,15 +119,75 @@ static bool have_cmd(const char* name) {
 static bool file_exists(const char* p) {
     struct stat st{}; return ::stat(p, &st) == 0 && S_ISREG(st.st_mode);
 }
+static bool env_set(const char* name) { return std::getenv(name) != nullptr; }
+
+// live terminal size (columns/rows)
+static int term_cols() {
+    winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
+    return COLS; // fallback
+}
+static int term_rows() {
+    winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
+    return ROWS + 6; // slack for title/prompt
+}
+
+// centered print using current terminal width
 static void center_line(const std::string& s) {
-    int w = COLS; int pad = std::max(0, (int)(w - (int)s.size()) / 2);
+    int w = term_cols();
+    int pad = std::max(0, (int)(w - (int)s.size()) / 2);
     for (int i = 0; i < pad; ++i) std::cout << ' ';
     std::cout << s << "\n";
 }
-static bool env_set(const char* name) { return std::getenv(name) != nullptr; }
 
-// ---------- Splash (inline PNG if kitty/iTerm2; else ASCII) ----------
+// tiny file->string and base64 for iTerm2 inline image (OSC 1337)
+static bool read_file(const char* path, std::string& out) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    std::vector<unsigned char> buf(4096);
+    out.clear();
+    size_t n;
+    while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0) out.append((const char*)buf.data(), n);
+    std::fclose(f);
+    return true;
+}
+static std::string b64_encode(const std::string& in) {
+    static const char* tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out; out.reserve((in.size()*4+2)/3);
+    size_t i = 0;
+    while (i + 3 <= in.size()) {
+        unsigned int v = ((unsigned char)in[i] << 16) |
+                         ((unsigned char)in[i+1] << 8) |
+                         ((unsigned char)in[i+2]);
+        out.push_back(tbl[(v >> 18) & 63]);
+        out.push_back(tbl[(v >> 12) & 63]);
+        out.push_back(tbl[(v >> 6)  & 63]);
+        out.push_back(tbl[v & 63]);
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        unsigned int v = ((unsigned char)in[i]) << 16;
+        out.push_back(tbl[(v >> 18) & 63]);
+        out.push_back(tbl[(v >> 12) & 63]);
+        out.push_back('=');
+        out.push_back('=');
+    } else if (i + 2 == in.size()) {
+        unsigned int v = (((unsigned char)in[i]) << 16) |
+                         (((unsigned char)in[i+1]) << 8);
+        out.push_back(tbl[(v >> 18) & 63]);
+        out.push_back(tbl[(v >> 12) & 63]);
+        out.push_back(tbl[(v >> 6)  & 63]);
+        out.push_back('=');
+    }
+    return out;
+}
+static bool is_iterm() { return std::getenv("ITERM_SESSION_ID") != nullptr; }
+
+// ---------- Splash ----------
 static constexpr const char* SPLASH_PATH = "assets/splash.png";
+static constexpr int SPLASH_SCALE_PCT = 40; // make image ~40% of terminal width/area
 
 static void ascii_splash_art() {
     const char* G  = "\x1b[92m";   // green
@@ -156,45 +218,60 @@ static void ascii_splash_art() {
 static void cinematic_splash_and_wait() {
     using namespace std::chrono;
 
-    // Clear and hide cursor
     std::cout << "\x1b[2J\x1b[H\x1b[?25l" << std::flush;
-    play_system_sound(SPLASH_SOUND); // soft hiss
+    play_system_sound(SPLASH_SOUND);
 
-    bool drew_inline_png = false;
+    bool showed_image = false;
 
-    // True inline image paths
-    if (env_set("KITTY_WINDOW_ID") && have_cmd("kitty") && file_exists(SPLASH_PATH)) {
-        drew_inline_png = true;
-        const char* sizes[] = { "40%", "70%", "100%" };
-        for (const char* s : sizes) {
-            std::cout << "\x1b[2J\x1b[H";
-            std::string cmd = std::string("kitty +kitten icat --align center --place ")
-                              + s + "x" + s + "@0x0 '" + SPLASH_PATH + "'";
-            (void)std::system(cmd.c_str());
+    // --- iTerm2: inline PNG (OSC 1337), auto-fit width of terminal ---
+    if (!showed_image && is_iterm() && file_exists(SPLASH_PATH)) {
+        std::string data;
+        if (read_file(SPLASH_PATH, data)) {
             center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
-            std::this_thread::sleep_for(200ms);
-        }
-    } else if (env_set("ITERM_SESSION_ID") && have_cmd("imgcat") && file_exists(SPLASH_PATH)) {
-        // Use imgcat only when actually inside iTerm2
-        drew_inline_png = true;
-        int widths[] = { 45, 70, 95 };
-        for (int w : widths) {
-            std::cout << "\x1b[2J\x1b[H";
-            std::string cmd = "imgcat --width=" + std::to_string(w) + " '" + SPLASH_PATH + "'";
-            int rc = std::system(cmd.c_str());
-            if (rc != 0) { drew_inline_png = false; break; } // fallback to ASCII
-            center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::cout << "\n";
+            std::string b64 = b64_encode(data);
+            // width=100% keeps image within current viewport; aspect preserved
+            std::cout << "\x1b]1337;File=name=splash.png;inline=1;width="
+            << SPLASH_SCALE_PCT << "%;preserveAspectRatio=1:"
+            << b64 << "\x07\n";
+        
+            showed_image = true;
         }
     }
 
-    if (!drew_inline_png) {
-        // Always-works fallback that stays inside the terminal
+    // --- kitty: inline PNG via icat, sized to current terminal area ---
+    if (!showed_image && std::getenv("KITTY_WINDOW_ID") && have_cmd("kitty") && file_exists(SPLASH_PATH)) {
+        showed_image = true;
+        int w = std::max(10, (term_cols() * SPLASH_SCALE_PCT) / 100);
+        int h = std::max(6,  (term_rows() * SPLASH_SCALE_PCT) / 100);
+
+        std::cout << "\x1b[2J\x1b[H";
+        std::string cmd = "kitty +kitten icat --align center --place "
+                        + std::to_string(w) + "x" + std::to_string(h) + "@0x0 '" + SPLASH_PATH + "'";
+        (void)std::system(cmd.c_str());
+        center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+        std::cout << "\n";
+    }
+
+    // --- iTerm2 imgcat CLI (still inline), sized to current columns ---
+    if (!showed_image && is_iterm() && have_cmd("imgcat") && file_exists(SPLASH_PATH)) {
+        showed_image = true;
+        int wcols = std::max(20, (term_cols() * SPLASH_SCALE_PCT) / 100);
+        std::cout << "\x1b[2J\x1b[H";
+        std::string cmd = "imgcat --width=" + std::to_string(wcols) + " '" + SPLASH_PATH + "'";
+        int rc = std::system(cmd.c_str());
+        if (rc != 0) showed_image = false;
+        center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+        std::cout << "\n";
+    }
+
+    // --- Fallback: centered ASCII splash ---
+    if (!showed_image) {
         std::cout << "\x1b[2J\x1b[H";
         ascii_splash_art();
     }
 
-    // Pulsing prompt
+    // Pulsing centered prompt (re-centers if user resizes)
     bool bright = true;
     auto last = std::chrono::steady_clock::now();
     while (true) {
@@ -202,18 +279,18 @@ static void cinematic_splash_and_wait() {
         auto now = std::chrono::steady_clock::now();
         if (now - last >= 400ms) {
             bright = !bright; last = now;
-            std::cout << "\r";
             std::string msg = bright
                 ? std::string("\x1b[92m[ Press any key to continue ]\x1b[0m")
                 : std::string("\x1b[32m[ Press any key to continue ]\x1b[0m");
-            int w = COLS; int pad = std::max(0, (int)(w - (int)msg.size()) / 2);
+            int w = term_cols();
+            int pad = std::max(0, (int)(w - (int)msg.size()) / 2);
+            std::cout << "\r";
             for (int i = 0; i < pad; ++i) std::cout << ' ';
             std::cout << msg << std::flush;
         }
         std::this_thread::sleep_for(50ms);
     }
 
-    // Restore cursor + clear before game
     std::cout << "\x1b[?25h\x1b[2J\x1b[H" << std::flush;
 }
 
@@ -490,12 +567,13 @@ int main() {
 
 
 // // snake_raw.cpp — macOS-friendly console Snake with raw keyboard input
-// // Features kept:
-// // - Blue playfield, green snake, yellow food
-// // - Pac-Man gulp animation (round 5x5 head opens/closes)
-// // - Poop trail: 3 brown dots after each eat, fading
+// // Features:
+// // - Blue playfield, green snake ("●"), yellow food ("●")
+// // - Pac-Man-ish gulp overlay when eating, plus score increment
+// // - Poop trail: 3 brown dots after each eat, fading over time
 // // - Sounds: randomized bite (Pop/Bottle/Funk/Tink/Ping), "Submarine" on poop
-// // - PNG splash screen: now cinematic (hiss + zoom + pulsing prompt)
+// // - Splash: inline PNG if kitty/iTerm2 supports it; otherwise colored ASCII splash
+// //   (No external Preview/Quick Look window; stays inside terminal)
 
 // #include <algorithm>
 // #include <atomic>
@@ -518,13 +596,13 @@ int main() {
 
 // using namespace std;
 
-// // --- Sound config ---
+// // ---------- Sound config ----------
 // static constexpr bool ENABLE_SOUNDS = true;
 // static constexpr bool ENABLE_BEEP_FALLBACK = false;
 
 // static const char* BITE_SOUNDS[] = { "Pop", "Bottle", "Funk", "Tink", "Ping" };
 // static constexpr const char* FART_SOUND   = "Submarine";
-// static constexpr const char* SPLASH_SOUND = "Purr";     // soft hiss/rumble on splash
+// static constexpr const char* SPLASH_SOUND = "Purr"; // soft hiss/rumble
 
 // static inline void play_system_sound(const char* name) {
 //     if (!ENABLE_SOUNDS || name == nullptr) return;
@@ -537,7 +615,7 @@ int main() {
 //     play_system_sound(BITE_SOUNDS[dist(rng)]);
 // }
 
-// // --- ANSI colors ---
+// // ---------- ANSI colors ----------
 // static constexpr const char* RESET = "\x1b[0m";
 // static constexpr const char* BG_BLUE = "\x1b[44m";
 // static constexpr const char* FG_WHITE = "\x1b[37m";
@@ -547,13 +625,13 @@ int main() {
 // static constexpr const char* FG_GRAY          = "\x1b[90m";
 // static constexpr const char* FG_GREEN         = "\x1b[32m";
 
-// // --- Config ---
+// // ---------- Config ----------
 // static constexpr int ROWS = 20;
 // static constexpr int COLS = 80;
 // static constexpr chrono::milliseconds TICK{100}; // 10 FPS
 // static constexpr int POOP_TTL = 12;              // poop fades
 
-// // --- Raw terminal guard ---
+// // ---------- Raw terminal guard ----------
 // struct RawTerm {
 //     termios orig{};
 //     bool ok{false};
@@ -572,7 +650,7 @@ int main() {
 //     }
 // };
 
-// // --- Input queue ---
+// // ---------- Input queue ----------
 // mutex in_mtx;
 // queue<char> in_q;
 // atomic<bool> running{true};
@@ -597,158 +675,201 @@ int main() {
 //     return c;
 // }
 
-// // ================= PNG splash helpers (robust path + file logging + Preview activate) =================
-// #include <limits.h>
-// #include <unistd.h>
-// #include <ctime>
-// #include <cstdio>
-
-// static constexpr const char* SPLASH_REL = "assets/splash.png";
-// static constexpr bool SPLASH_DEBUG = true;   // << keep true to write /tmp/snake_splash.log
-
-// static void dbg(const std::string& msg) {
-//     if (!SPLASH_DEBUG) return;
-//     FILE* f = std::fopen("/tmp/snake_splash.log", "a");
-//     if (!f) return;
-//     std::time_t t = std::time(nullptr);
-//     std::fprintf(f, "[%ld] %s\n", (long)t, msg.c_str());
-//     std::fclose(f);
-// }
-
-// static std::string cwd_abs() {
-//     char buf[PATH_MAX];
-//     if (::getcwd(buf, sizeof(buf))) return std::string(buf);
-//     return ".";
-// }
-// static std::string join_path(const std::string& a, const std::string& b) {
-//     if (a.empty()) return b;
-//     if (a.back() == '/') return a + b;
-//     return a + "/" + b;
-// }
-// static std::string realpath_or(const std::string& p) {
-//     char buf[PATH_MAX];
-//     if (::realpath(p.c_str(), buf)) return std::string(buf);
-//     return p;
-// }
-// static bool file_exists_abs(const std::string& p) {
-//     struct stat st{}; return ::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
-// }
+// // ---------- Small helpers ----------
 // static bool have_cmd(const char* name) {
 //     std::string cmd = "command -v ";
 //     cmd += name;
 //     cmd += " >/dev/null 2>&1";
-//     int rc = std::system(cmd.c_str());
-//     dbg(std::string("have_cmd('") + name + "') rc=" + std::to_string(rc));
-//     return rc == 0;
+//     return std::system(cmd.c_str()) == 0;
 // }
-// static void close_external_viewers() {
-//     std::system("killall qlmanage >/dev/null 2>&1");
-//     std::system("osascript -e 'tell application \"Preview\" to quit' >/dev/null 2>&1");
+// static bool file_exists(const char* p) {
+//     struct stat st{}; return ::stat(p, &st) == 0 && S_ISREG(st.st_mode);
 // }
 // static void center_line(const std::string& s) {
-//     int w = COLS;
-//     int pad = std::max(0, (int)(w - (int)s.size()) / 2); // <-- use s.size(), not msg.size()
+//     int w = COLS; int pad = std::max(0, (int)(w - (int)s.size()) / 2);
+//     for (int i = 0; i < pad; ++i) std::cout << ' ';
+//     std::cout << s << "\n";
+// }
+// static bool env_set(const char* name) { return std::getenv(name) != nullptr; }
+
+// // ---------- Splash (inline PNG if kitty/iTerm2; else ASCII) ----------
+// static constexpr const char* SPLASH_PATH = "assets/splash.png";
+
+// static void ascii_splash_art() {
+//     const char* G  = "\x1b[92m";   // green
+//     const char* Y  = "\x1b[93m";   // yellow
+//     const char* R  = "\x1b[91m";   // red
+//     const char* Wt = "\x1b[97m";   // white
+//     const char* Br = "\x1b[38;5;130m"; // brown
+//     const char* Rt = "\x1b[0m";
+//     std::vector<std::string> art = {
+//         std::string(G) + "           ________                          " + Rt,
+//         std::string(G) + "        .-`  ____  `-.                       " + Rt,
+//         std::string(G) + "      .'   .`    `.   `.                     " + Rt,
+//         std::string(G) + "     /   .'   " + R + "◥◤" + G + "   `.   \\                    " + Rt,
+//         std::string(G) + "    ;   /    " + Wt + " __ __ " + G + "   \\   ;                   " + Rt,
+//         std::string(G) + "    |  |   " + Wt + " /__V__\\ " + G + "  |  |   " + Y + "   ●" + Rt,
+//         std::string(G) + "    |  |  " + R + "  \\____/ " + G + "  " + R + "\\/" + G + " |  |   " + Br + "  ● ● ●" + Rt,
+//         std::string(G) + "    ;   \\      " + R + "┏━┓" + G + "      /   ;   " + Br + "  ●●● ●●●" + Rt,
+//         std::string(G) + "     \\    `._ " + Wt + "V  V" + G + "  _.'   /                    " + Rt,
+//         std::string(G) + "      `.     `-.__.-'     .'                 " + Rt,
+//         std::string(G) + "        `-._            _.-'                  " + Rt
+//     };
+//     center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+//     std::cout << "\n";
+//     for (auto& line : art) center_line(line);
+//     std::cout << "\n";
+// }
+
+// // --- tiny file->string and base64 for iTerm2 inline image ---
+// static bool read_file(const char* path, std::string& out) {
+//     FILE* f = std::fopen(path, "rb");
+//     if (!f) return false;
+//     std::vector<unsigned char> buf(4096);
+//     out.clear();
+//     size_t n;
+//     while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0) out.append((const char*)buf.data(), n);
+//     std::fclose(f);
+//     return true;
+// }
+// static std::string b64_encode(const std::string& in) {
+//     static const char* tbl =
+//         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+//     std::string out; out.reserve((in.size()*4+2)/3);
+//     size_t i = 0;
+//     while (i + 3 <= in.size()) {
+//         unsigned int v = ((unsigned char)in[i] << 16) |
+//                          ((unsigned char)in[i+1] << 8) |
+//                          ((unsigned char)in[i+2]);
+//         out.push_back(tbl[(v >> 18) & 63]);
+//         out.push_back(tbl[(v >> 12) & 63]);
+//         out.push_back(tbl[(v >> 6)  & 63]);
+//         out.push_back(tbl[v & 63]);
+//         i += 3;
+//     }
+//     if (i + 1 == in.size()) {
+//         unsigned int v = ((unsigned char)in[i]) << 16;
+//         out.push_back(tbl[(v >> 18) & 63]);
+//         out.push_back(tbl[(v >> 12) & 63]);
+//         out.push_back('=');
+//         out.push_back('=');
+//     } else if (i + 2 == in.size()) {
+//         unsigned int v = (((unsigned char)in[i]) << 16) |
+//                          (((unsigned char)in[i+1]) << 8);
+//         out.push_back(tbl[(v >> 18) & 63]);
+//         out.push_back(tbl[(v >> 12) & 63]);
+//         out.push_back(tbl[(v >> 6)  & 63]);
+//         out.push_back('=');
+//     }
+//     return out;
+// }
+
+// #include <sys/ioctl.h>
+
+// // live terminal size (columns/rows)
+// static int term_cols() {
+//     winsize ws{};
+//     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
+//     return COLS; // fallback to your compiled-in width
+// }
+// static int term_rows() {
+//     winsize ws{};
+//     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
+//     return ROWS + 6; // bit of slack for borders/title
+// }
+
+// // centered print using current terminal width
+// static void center_line(const std::string& s) {
+//     int w = term_cols();
+//     int pad = std::max(0, (int)(w - (int)s.size()) / 2);
 //     for (int i = 0; i < pad; ++i) std::cout << ' ';
 //     std::cout << s << "\n";
 // }
 
+// static bool is_iterm() { return std::getenv("ITERM_SESSION_ID") != nullptr; }
 
 // static void cinematic_splash_and_wait() {
 //     using namespace std::chrono;
 
-//     const std::string joined = join_path(cwd_abs(), SPLASH_REL);
-//     const std::string abs_splash = realpath_or(joined);
-//     dbg(std::string("CWD=") + cwd_abs());
-//     dbg(std::string("SPLASH_REL=") + SPLASH_REL);
-//     dbg(std::string("joined=") + joined);
-//     dbg(std::string("abs_splash=") + abs_splash);
-//     dbg(std::string("exists=") + (file_exists_abs(abs_splash) ? "yes" : "no"));
-
 //     std::cout << "\x1b[2J\x1b[H\x1b[?25l" << std::flush;
+//     play_system_sound(SPLASH_SOUND);
 
-//     bool used_external = false;
-//     bool inline_img = false;
+//     bool showed_image = false;
 
-//     play_system_sound("Purr");
-
-//     if (file_exists_abs(abs_splash)) {
-//         if (std::getenv("KITTY_WINDOW_ID") && have_cmd("kitty")) {
-//             inline_img = true;
-//             const char* sizes[] = { "40%", "70%", "100%" };
-//             for (const char* s : sizes) {
-//                 std::cout << "\x1b[2J\x1b[H";
-//                 std::string cmd = std::string("kitty +kitten icat --align center --place ")
-//                                   + s + "x" + s + "@0x0 '" + abs_splash + "'";
-//                 dbg(std::string("RUN: ") + cmd);
-//                 int rc = std::system(cmd.c_str());
-//                 dbg(std::string("RET=") + std::to_string(rc));
-//                 center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
-//                 std::this_thread::sleep_for(200ms);
-//             }
-//         } else if (std::getenv("ITERM_SESSION_ID") && have_cmd("imgcat")) {
-//             inline_img = true;
-// int widths[] = { 45, 70, 95 };
-// for (int w : widths) {
-//     std::cout << "\x1b[2J\x1b[H";
-//     std::string cmd = "imgcat --width=" + std::to_string(w) + " '" + abs_splash + "'";
-//     int rc = std::system(cmd.c_str());
-//     if (rc != 0) { // imgcat failed — bail to Preview
-//         inline_img = false;
-//         break;
-//     }
-//     center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
-//     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-// }
-
-//         }
-
-//         if (!inline_img) {
-//             // Reliable fallback: Preview (bring to front)
-//             std::string cmd = "open -g -a Preview '" + abs_splash + "'";
-//             dbg(std::string("RUN: ") + cmd);
-//             int rc = std::system(cmd.c_str());
-//             dbg(std::string("RET=") + std::to_string(rc));
-//             // Activate Preview so it doesn’t hide on another Space
-//             int rc2 = std::system("osascript -e 'tell application \"Preview\" to activate' >/dev/null 2>&1");
-//             dbg(std::string("activate Preview rc=") + std::to_string(rc2));
-
-//             used_external = true;
-//             std::this_thread::sleep_for(150ms);
+//     // --- iTerm2: draw PNG inline, scaled to terminal width (100% of columns) ---
+//     if (!showed_image && std::getenv("ITERM_SESSION_ID") && file_exists(SPLASH_PATH)) {
+//         std::string data;
+//         if (read_file(SPLASH_PATH, data)) {
+//             // Fit width to terminal, preserve aspect
 //             center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+//             std::cout << "\n";
+//             std::string b64 = b64_encode(data);
+//             // width in %, iTerm scales to viewport; use 100% to always fit
+//             std::cout << "\x1b]1337;File=name=splash.png;inline=1;width=100%;preserveAspectRatio=1:"
+//                       << b64 << "\x07\n";
+//             showed_image = true;
 //         }
-//     } else {
-//         center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
-//         center_line("\x1b[90m(splash image missing)\x1b[0m");
 //     }
 
+//     // --- kitty: place image to fill available cells while centered ---
+//     if (!showed_image && std::getenv("KITTY_WINDOW_ID") && have_cmd("kitty") && file_exists(SPLASH_PATH)) {
+//         showed_image = true;
+//         int w = std::max(10, term_cols() - 2);              // leave a small margin
+//         int h = std::max(6,  term_rows() - 8);              // room for title + prompt
+//         std::cout << "\x1b[2J\x1b[H";
+//         // --place WxH@0x0 paints into the grid; --align center keeps it centered
+//         std::string cmd = "kitty +kitten icat --align center --place "
+//                         + std::to_string(w) + "x" + std::to_string(h) + "@0x0 '" + SPLASH_PATH + "'";
+//         (void)std::system(cmd.c_str());
+//         center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+//         std::cout << "\n";
+//     }
+
+//     // --- iTerm2 imgcat CLI fallback (still inside terminal) ---
+//     if (!showed_image && std::getenv("ITERM_SESSION_ID") && have_cmd("imgcat") && file_exists(SPLASH_PATH)) {
+//         showed_image = true;
+//         int wcols = std::max(20, term_cols() - 4); // fit viewport, small margins
+//         std::cout << "\x1b[2J\x1b[H";
+//         std::string cmd = "imgcat --width=" + std::to_string(wcols) + " '" + SPLASH_PATH + "'";
+//         int rc = std::system(cmd.c_str());
+//         if (rc != 0) showed_image = false;
+//         center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+//         std::cout << "\n";
+//     }
+
+//     // --- Fallback: ANSI art (always fits + centered using term_cols) ---
+//     if (!showed_image) {
+//         std::cout << "\x1b[2J\x1b[H";
+//         ascii_splash_art(); // uses center_line() which now reads term width live
+//     }
+
+//     // Pulsing centered prompt (uses live width)
 //     bool bright = true;
-//     auto last = steady_clock::now();
+//     auto last = std::chrono::steady_clock::now();
 //     while (true) {
 //         if (auto k = read_key_now()) break;
-
-//         auto now = steady_clock::now();
+//         auto now = std::chrono::steady_clock::now();
 //         if (now - last >= 400ms) {
-//             bright = !bright;
-//             last = now;
-//             std::cout << "\r";
+//             bright = !bright; last = now;
 //             std::string msg = bright
 //                 ? std::string("\x1b[92m[ Press any key to continue ]\x1b[0m")
 //                 : std::string("\x1b[32m[ Press any key to continue ]\x1b[0m");
-//             int w = COLS; int pad = std::max(0, (int)(w - (int)msg.size()) / 2);
+//             // re-center each flash in case the user resizes during splash
+//             int w = term_cols();
+//             int pad = std::max(0, (int)(w - (int)msg.size()) / 2);
+//             std::cout << "\r";
 //             for (int i = 0; i < pad; ++i) std::cout << ' ';
 //             std::cout << msg << std::flush;
 //         }
 //         std::this_thread::sleep_for(50ms);
 //     }
 
-//     if (used_external) close_external_viewers();
-
 //     std::cout << "\x1b[?25h\x1b[2J\x1b[H" << std::flush;
 // }
-// // =====================================================================
 
 
-// // --- Game model ---
+
+// // ---------- Game model ----------
 // struct Point { int r, c; };
 // enum class Dir { Up, Down, Left, Right };
 // struct Poop { Point p; int ttl; };
@@ -982,13 +1103,14 @@ int main() {
 
 //     RawTerm raw;
 
-//     // Cinematic PNG splash and wait for key
+//     // Inline PNG if supported (kitty/iTerm2), else colored ASCII — all inside terminal
 //     cinematic_splash_and_wait();
 
 //     Game game;
 //     auto next_tick = chrono::steady_clock::now();
 
 //     while (running.load()) {
+//         // pump raw keys
 //         while (true) {
 //             auto k = read_key_now();
 //             if (!k) break;

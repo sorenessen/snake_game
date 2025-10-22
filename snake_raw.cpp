@@ -274,7 +274,7 @@ static void ascii_splash_art() {
         std::string(G) + "      `.     `-.__.-'     .'                 " + Rt,
         std::string(G) + "        `-._            _.-'                  " + Rt
     };
-    center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+    center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE WHO EATS ITS OWN SHIT FOR BREAKFAST\x1b[0m");
     std::cout << "\n";
     for (auto& line : art) center_line(line);
     std::cout << "\n";
@@ -295,7 +295,7 @@ static void cinematic_splash_and_wait() {
     if (!showed_image && is_iterm() && file_exists(SPLASH_PATH)) {
         std::string data;
         if (read_file(SPLASH_PATH, data)) {
-            center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE\x1b[0m");
+            center_line("\x1b[1m\x1b[92mTHE FIERCE POOPING SNAKE WHO EATS PIECES OF SHIT LIKE YOU FOR BREAKFAST!\x1b[0m");
             std::cout << "\n";
             for (int i = 0; i < pad; ++i) std::cout << ' ';
             std::string b64 = b64_encode(data);

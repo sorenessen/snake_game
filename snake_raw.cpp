@@ -96,12 +96,13 @@ static const std::string WIDE_HEAD = "🟢";
 
 // ---------- Taunts for floating text ----------
 static const char* TAUNTS[] = {
-    "NICE SHIT!",
-    "YOU GONNA EAT THAT?!",
+    "PBBBBBT",
+    "PLOP PLOP PLOP",
     "CLEAN UP YOUR MESS!",
-    "EW! YOU POOED",
-    "THIS IS WHY DADDY LEFT US!",
-    "DISGUSTING!"
+    "SQUIRT SQUIRT PBBBBT",
+    "YOU'RE WHY DAD LEFT",
+    "DISGUSTING!",
+    "SHARTING IS A SKILL!"
 };
 static constexpr int TAUNTS_COUNT = (int)(sizeof(TAUNTS) / sizeof(TAUNTS[0]));
 

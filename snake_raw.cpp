@@ -41,8 +41,6 @@ static constexpr const char* DISARM_SOUND  = "Ping";
 // 🟤 Custom local WAVs inside assets/
 static constexpr const char* POOP_WAV = "assets/snake_shit.wav";     // on poop activation (tail vacates)
 static constexpr const char* NOM_WAV  = "assets/nom_nom_nom.wav";    // poop-eating (final pellet)
-static constexpr const char* EW_WAV   = "assets/ew_thats_gross.wav"; // poop-eating (final pellet)
-static constexpr const char* FLOSS_WAV= "assets/floss.wav";          // poop-eating (final pellet)
 static constexpr const char* NASTY_WAV= "assets/nasty.wav";          // poop-eating (final pellet)
 static constexpr const char* GROSS_WAV= "assets/gross.wav";          // poop-eating (final pellet)
 
@@ -438,7 +436,7 @@ struct Game {
         place_food();
 
         // Build the verified poop-eating sound pool once.
-        const char* candidates[] = { NOM_WAV, EW_WAV, FLOSS_WAV, NASTY_WAV, GROSS_WAV };
+        const char* candidates[] = { NOM_WAV, NASTY_WAV, GROSS_WAV };
         for (const char* p : candidates) {
             if (file_exists(p)) eat_sfx.push_back(p);
         }

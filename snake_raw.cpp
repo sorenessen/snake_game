@@ -198,6 +198,10 @@ static constexpr const char* FG_RED           = "\x1b[91m";
 static constexpr const char* FG_ORANGE_208    = "\x1b[38;5;208m";
 static constexpr const char* FG_YELLOW        = "\x1b[33m";
 
+// Background fill toggle for playfield rows
+static constexpr bool USE_BLUE_BG = false; // was hard-coded true before
+
+
 // ✨ Gold frame shades
 static constexpr const char* FG_GOLD_DARK   = "\x1b[38;5;178m"; // outer
 static constexpr const char* FG_GOLD_MAIN   = "\x1b[38;5;220m"; // inner pillars
@@ -1014,8 +1018,10 @@ struct Game {
             }
 
             bool invert = (level_flash > 0 && ((level_flash / 2) % 2) == 0);
-            if (invert) cout << "\x1b[7m";
-            cout << BG_BLUE << FG_WHITE;
+                if (invert) cout << "\x1b[7m";
+                if (USE_BLUE_BG) cout << BG_BLUE;  // only if you want that retro solid fill
+                cout << FG_WHITE;
+
 
             for (int c = 0; c < COLS; ++c) {
                 // 1) Floating text overlays everything

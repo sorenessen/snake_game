@@ -268,11 +268,11 @@ static inline void print_egyptian_bevel(int pad) {
 
 // ---------- Credits data ----------
 static const std::vector<std::string> CREDITS = {
-    "Lead Developer: Cinnamon Essen",
+    "Lead Developer: Cinnamon Hoffman",
     "UX Designer: Gregory Birdmouth",
     "Master Logician: Skip Sinclair",
     "Ham Curer: Bellingham Frisk",
-    "Q-Tip Procurer: Soren Essen",
+    "Narcotics: Sequoia Essen",
     "Soap Dispenser Repair: Bob Garry",
     "Sweat Dobber: Sarah from Marketing",
     "Snake Costume Designer: Wulf Kraut",
@@ -561,7 +561,7 @@ static void cinematic_splash_and_wait() {
 
     // ---- Timing setup (single source of truth) ----
     using steady_clock = std::chrono::steady_clock;
-    const double rows_per_second = 0.55;                 // scroll speed
+    const double rows_per_second = 1;                 // scroll speed
     const std::chrono::milliseconds frame_dt(33);        // ~30 FPS
 
     auto start = steady_clock::now();
